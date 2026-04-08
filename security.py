@@ -1,7 +1,12 @@
-# ai_agent.py
+# security.py (or ai_agent.py)
+
+import os
+import re
+import httpx
 from dataclasses import dataclass
 from typing import List
-import re
+
+LLM_API_KEY = os.environ("LLM_API_KEY")
 
 
 # ─────────────────────────────────────────────
@@ -24,7 +29,7 @@ class InlineComment:
 
 
 # ─────────────────────────────────────────────
-# Diff Parser (minimal)
+# Diff Parser
 # ─────────────────────────────────────────────
 class DiffParser:
     @staticmethod
@@ -40,7 +45,7 @@ class DiffParser:
 
             elif line.startswith("@@"):
                 parts = line.split(" ")
-                new_line_info = parts[2]  # +start,count
+                new_line_info = parts[2]
                 start = int(new_line_info.split(",")[0][1:])
                 line_no = start
 
@@ -54,69 +59,72 @@ class DiffParser:
 
 
 # ─────────────────────────────────────────────
-# Security Patterns
+# FAST SECURITY PATTERNS (KEEP THIS)
 # ─────────────────────────────────────────────
 PATTERNS = [
-    {
-        "regex": r'api[_-]?key\s*=\s*["\'].*["\']',
-        "severity": "critical",
-        "msg": "Hardcoded API Key detected",
-        "fix": "Use environment variables (os.getenv)"
-    },
-    {
-        "regex": r'password\s*=\s*["\'].*["\']',
-        "severity": "critical",
-        "msg": "Hardcoded password detected",
-        "fix": "Store secrets securely (env/secret manager)"
-    },
-    {
-        "regex": r'execute\(f".*{.*}.*"\)',
-        "severity": "high",
-        "msg": "Possible SQL Injection",
-        "fix": "Use parameterized queries"
-    },
-    {
-        "regex": r'subprocess.*shell=True',
-        "severity": "high",
-        "msg": "Shell injection risk",
-        "fix": "Use shell=False and pass args as list"
-    },
-    {
-        "regex": r'eval\(',
-        "severity": "high",
-        "msg": "Use of eval() is dangerous",
-        "fix": "Avoid eval, use safer parsing"
-    },
-    {
-        "regex": r'hashlib\.md5',
-        "severity": "medium",
-        "msg": "Weak hashing algorithm (MD5)",
-        "fix": "Use sha256 or bcrypt"
-    },
+    (r'api[_-]?key\s*=\s*["\'].*["\']', "Hardcoded API Key", "Use env variables"),
+    (r'password\s*=\s*["\'].*["\']', "Hardcoded password", "Use secret manager"),
+    (r'eval\(', "Use of eval()", "Avoid eval"),
+    (r'subprocess.*shell=True', "Shell injection risk", "Use shell=False"),
 ]
 
 
 # ─────────────────────────────────────────────
-# Dependency Scanner
+# LLM ANALYSIS
 # ─────────────────────────────────────────────
-def check_dependencies(file_path: str, line: str):
-    comments = []
+def llm_security_analysis(code: str):
+    if not LLM_API_KEY:
+        return []
 
-    vulnerable_libs = {
-        "django==1.2": "Upgrade Django (known CVEs)",
-        "flask==0.12": "Upgrade Flask (security issues)",
-        "requests==2.19.0": "Upgrade requests (CVE present)",
-    }
+    try:
+        response = httpx.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {LLM_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a security code reviewer. Return ONLY JSON."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"""
+Analyze this code for security vulnerabilities.
 
-    for lib, fix in vulnerable_libs.items():
-        if lib in line:
-            comments.append((lib, fix))
+Return JSON array:
+[
+  {{
+    "severity": "high|medium|low",
+    "issue": "short description",
+    "fix": "suggested fix"
+  }}
+]
 
-    return comments
+Code:
+{code}
+"""
+                    }
+                ],
+                "temperature": 0.2,
+            },
+            timeout=20
+        )
+
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+
+        return eval(content) if content.startswith("[") else []
+
+    except Exception:
+        return []
 
 
 # ─────────────────────────────────────────────
-# Main Security Scanner
+# MAIN SCANNER
 # ─────────────────────────────────────────────
 class SecurityScanner:
 
@@ -128,36 +136,34 @@ class SecurityScanner:
         for file, lines in parsed.items():
             for line_no, code in lines:
 
-                # Pattern scan
-                for p in PATTERNS:
-                    if re.search(p["regex"], code):
-                        results.append(
-                            InlineComment(
-                                path=file,
-                                line=line_no,
-                                severity=p["severity"],
-                                body=(
-                                    f"⚠️ **{p['severity'].upper()}**: {p['msg']}\n\n"
-                                    f"`{code.strip()}`\n\n"
-                                    f"💡 Fix: {p['fix']}"
-                                )
-                            )
-                        )
-
-                # Dependency scan
-                if "requirements.txt" in file or "package.json" in file:
-                    deps = check_dependencies(file, code)
-                    for lib, fix in deps:
+                # 🔹 1. Fast regex scan
+                for pattern, msg, fix in PATTERNS:
+                    if re.search(pattern, code):
                         results.append(
                             InlineComment(
                                 path=file,
                                 line=line_no,
                                 severity="high",
-                                body=(
-                                    f"🚨 Vulnerable dependency: `{lib}`\n\n"
-                                    f"💡 Fix: {fix}"
-                                )
+                                body=f"🚨 {msg}\n\n`{code.strip()}`\n\n💡 Fix: {fix}"
                             )
                         )
+
+                # 🔹 2. LLM scan (NEW 🔥)
+                llm_results = llm_security_analysis(code)
+
+                for issue in llm_results:
+                    results.append(
+                        InlineComment(
+                            path=file,
+                            line=line_no,
+                            severity=issue.get("severity", "medium"),
+                            body=(
+                                f"🤖 **AI Security Insight**\n\n"
+                                f"⚠️ {issue.get('issue')}\n\n"
+                                f"`{code.strip()}`\n\n"
+                                f"💡 Fix: {issue.get('fix')}"
+                            )
+                        )
+                    )
 
         return results
