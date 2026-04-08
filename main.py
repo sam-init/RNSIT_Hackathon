@@ -7,8 +7,8 @@ import hashlib
 
 app = FastAPI()
 
-GITHUB_TOKEN = os.getenv("/etc/secrets/GITHUB_TOKEN")
-WEBHOOK_SECRET = os.getenv("/etc/secrets/WEBHOOK_SECRET")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 if not WEBHOOK_SECRET:
     raise Exception("❌ WEBHOOK_SECRET not set")
