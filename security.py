@@ -6,7 +6,7 @@ import httpx
 from dataclasses import dataclass
 from typing import List
 
-LLM_API_KEY = os.environ("LLM_API_KEY")
+LLM_API_KEY = os.environ["LLM_API_KEY"]
 
 
 # ─────────────────────────────────────────────
