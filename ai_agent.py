@@ -32,7 +32,7 @@ CACHE_DIR.mkdir(exist_ok=True)
 
 # Default LLM endpoint (NVIDIA API). Override via env PH_LLM_ENDPOINT.
 DEFAULT_LLM_ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
-LLM_API_KEY = "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"  # Optional, can be empty for local models
+LLM_API_KEY = os.getenv("LLM_API_KEY")  # Optional, can be empty for local models
 LLM_ENDPOINT = os.getenv("PH_LLM_ENDPOINT", DEFAULT_LLM_ENDPOINT)
 LLM_MODEL = os.getenv("PH_LLM_MODEL", "meta/llama-3.1-8b-instruct")
 
