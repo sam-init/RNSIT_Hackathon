@@ -1,5 +1,4 @@
-# security.py (or ai_agent.py)
-
+# security.py
 import os
 import re
 import httpx
@@ -9,9 +8,6 @@ from typing import List
 LLM_API_KEY = os.environ["LLM_API_KEY"]
 
 
-# ─────────────────────────────────────────────
-# Inline Comment Model
-# ─────────────────────────────────────────────
 @dataclass
 class InlineComment:
     path: str
@@ -33,7 +29,7 @@ class InlineComment:
 # ─────────────────────────────────────────────
 class DiffParser:
     @staticmethod
-    def parse(diff_text: str):
+    def parse(diff_text):
         files = {}
         current_file = None
         line_no = 0
@@ -45,8 +41,7 @@ class DiffParser:
 
             elif line.startswith("@@"):
                 parts = line.split(" ")
-                new_line_info = parts[2]
-                start = int(new_line_info.split(",")[0][1:])
+                start = int(parts[2].split(",")[0][1:])
                 line_no = start
 
             elif current_file and line.startswith("+"):
@@ -59,25 +54,26 @@ class DiffParser:
 
 
 # ─────────────────────────────────────────────
-# FAST SECURITY PATTERNS (KEEP THIS)
+# Regex Patterns
 # ─────────────────────────────────────────────
 PATTERNS = [
-    (r'api[_-]?key\s*=\s*["\'].*["\']', "Hardcoded API Key", "Use env variables"),
+    (r'api[_-]?key\s*=\s*["\'].*["\']', "Hardcoded API key", "Use env variables"),
     (r'password\s*=\s*["\'].*["\']', "Hardcoded password", "Use secret manager"),
     (r'eval\(', "Use of eval()", "Avoid eval"),
-    (r'subprocess.*shell=True', "Shell injection risk", "Use shell=False"),
+    (r'subprocess.*shell=True', "Shell injection", "Use shell=False"),
+    (r'<script>', "Possible XSS", "Sanitize input"),
 ]
 
 
 # ─────────────────────────────────────────────
 # LLM ANALYSIS
 # ─────────────────────────────────────────────
-def llm_security_analysis(code: str):
+def llm_analysis(code):
     if not LLM_API_KEY:
         return []
 
     try:
-        response = httpx.post(
+        res = httpx.post(
             "https://api.openai.com/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {LLM_API_KEY}",
@@ -86,36 +82,15 @@ def llm_security_analysis(code: str):
             json={
                 "model": "gpt-4o-mini",
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a security code reviewer. Return ONLY JSON."
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""
-Analyze this code for security vulnerabilities.
-
-Return JSON array:
-[
-  {{
-    "severity": "high|medium|low",
-    "issue": "short description",
-    "fix": "suggested fix"
-  }}
-]
-
-Code:
-{code}
-"""
-                    }
+                    {"role": "system", "content": "Return ONLY JSON"},
+                    {"role": "user", "content": f"Find security issues:\n{code}"}
                 ],
-                "temperature": 0.2,
+                "temperature": 0.2
             },
-            timeout=20
+            timeout=15
         )
 
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
+        content = res.json()["choices"][0]["message"]["content"]
 
         return eval(content) if content.startswith("[") else []
 
@@ -129,39 +104,37 @@ Code:
 class SecurityScanner:
 
     @staticmethod
-    def scan(diff_text: str) -> List[InlineComment]:
+    def scan(diff_text) -> List[InlineComment]:
         parsed = DiffParser.parse(diff_text)
         results = []
 
         for file, lines in parsed.items():
             for line_no, code in lines:
 
-                # 🔹 1. Fast regex scan
+                # Regex scan
                 for pattern, msg, fix in PATTERNS:
                     if re.search(pattern, code):
                         results.append(
                             InlineComment(
                                 path=file,
                                 line=line_no,
-                                severity="high",
-                                body=f"🚨 {msg}\n\n`{code.strip()}`\n\n💡 Fix: {fix}"
+                                body=f"🚨 {msg}\n\n`{code}`\n\n💡 Fix: {fix}"
                             )
                         )
 
-                # 🔹 2. LLM scan (NEW 🔥)
-                llm_results = llm_security_analysis(code)
+                # LLM scan
+                llm_results = llm_analysis(code)
 
                 for issue in llm_results:
                     results.append(
                         InlineComment(
                             path=file,
                             line=line_no,
-                            severity=issue.get("severity", "medium"),
                             body=(
-                                f"🤖 **AI Security Insight**\n\n"
-                                f"⚠️ {issue.get('issue')}\n\n"
-                                f"`{code.strip()}`\n\n"
-                                f"💡 Fix: {issue.get('fix')}"
+                                f"🤖 AI Insight\n\n"
+                                f"{issue.get('issue')}\n\n"
+                                f"`{code}`\n\n"
+                                f"💡 {issue.get('fix')}"
                             )
                         )
                     )

@@ -1,70 +1,100 @@
-# main.py
+# processor.py
 import os
-import hmac
-import hashlib
+import httpx
 import logging
-from fastapi import FastAPI, Request, Header, HTTPException
-from concurrent.futures import ThreadPoolExecutor
 
-from processor import process_pr_event
+from security import SecurityScanner
 
-# ─────────────────────────────────────────────
-# Logging Setup
-# ─────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("main")
-
-app = FastAPI()
+logger = logging.getLogger("processor")
 
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"].encode()
-
-executor = ThreadPoolExecutor(max_workers=4)
 
 
 # ─────────────────────────────────────────────
-# Verify Signature
+# Get Diff (FIXED ✅)
 # ─────────────────────────────────────────────
-def verify_signature(body: bytes, signature: str):
-    logger.info("🔐 Verifying GitHub signature")
+def get_diff(repo, pr_number):
+    url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
 
-    if not signature:
-        logger.error("❌ Missing signature")
-        raise HTTPException(403, "Missing signature")
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3.diff",
+    }
 
-    sha_name, sig = signature.split("=")
-    mac = hmac.new(WEBHOOK_SECRET, msg=body, digestmod=hashlib.sha256)
+    logger.info(f"🌐 Fetching diff from API: {url}")
 
-    if not hmac.compare_digest(mac.hexdigest(), sig):
-        logger.error("❌ Invalid signature")
-        raise HTTPException(403, "Invalid signature")
+    response = httpx.get(url, headers=headers)
 
-    logger.info("✅ Signature verified")
+    if response.status_code != 200:
+        logger.error(f"❌ Diff fetch failed: {response.text}")
+        return ""
+
+    logger.info(f"✅ Diff fetched ({len(response.text)} chars)")
+    return response.text
 
 
 # ─────────────────────────────────────────────
-# Webhook Endpoint
+# Post Review
 # ─────────────────────────────────────────────
-@app.post("/webhook")
-async def webhook(
-    request: Request,
-    x_hub_signature_256: str = Header(None),
-):
-    logger.info("📩 Webhook received")
+def post_review(repo, pr_number, commit_id, comments):
+    url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/reviews"
 
-    body = await request.body()
+    payload = {
+        "commit_id": commit_id,
+        "event": "COMMENT",
+        "comments": [c.to_github_payload() for c in comments],
+    }
 
-    verify_signature(body, x_hub_signature_256)
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
 
-    payload = await request.json()
-    action = payload.get("action")
+    logger.info(f"📤 Posting {len(comments)} comments")
 
-    logger.info(f"🔄 Action: {action}")
+    response = httpx.post(url, json=payload, headers=headers)
 
-    if action in ["opened", "synchronize"]:
-        logger.info("🚀 Submitting PR for processing")
-        executor.submit(process_pr_event, payload)
+    if response.status_code not in [200, 201]:
+        logger.error(f"❌ GitHub error: {response.text}")
     else:
-        logger.info("⏭️ Ignored event")
+        logger.info("✅ Review posted")
 
-    return {"status": "ok"}
+
+# ─────────────────────────────────────────────
+# PROCESSOR (MAIN LOGIC)
+# ─────────────────────────────────────────────
+def process_pr_event(payload):
+    logger.info("🔍 Processing PR")
+
+    try:
+        pr = payload["pull_request"]
+
+        repo = payload["repository"]["full_name"]
+        pr_number = pr["number"]
+        commit_id = pr["head"]["sha"]
+
+        logger.info(f"📦 Repo: {repo}")
+        logger.info(f"🔢 PR: {pr_number}")
+
+        # ✅ FIXED DIFF FETCH
+        diff = get_diff(repo, pr_number)
+
+        if not diff:
+            logger.warning("⚠️ Empty diff")
+            return
+
+        logger.info(f"📄 Diff preview:\n{diff[:300]}")
+
+        # Run Security Agent
+        comments = SecurityScanner.scan(diff)
+
+        logger.info(f"🧠 Found {len(comments)} issues")
+
+        if comments:
+            post_review(repo, pr_number, commit_id, comments)
+        else:
+            logger.info("✅ No issues found")
+
+    except Exception as e:
+        logger.error(f"🔥 Error: {e}")
