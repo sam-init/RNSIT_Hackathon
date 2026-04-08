@@ -1,0 +1,2103 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Code Review Copilot — Multi-Agent PR Analysis</title>
+  <meta name="description"
+    content="Instant PR reviews powered by multi-agent AI. Integrates with GitHub, analyzes code using Groq, NVIDIA, and Gemini LLMs, and auto-comments on pull requests." />
+  <meta name="keywords" content="AI code review, GitHub PR, multi-agent, Groq, NVIDIA, Gemini, automated review" />
+
+  <style>
+    /* ============================================
+       RESET & BASE
+    ============================================ */
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    :root {
+      --bg-base: #0a0c10;
+      --bg-surface: #0d1117;
+      --bg-card: #161b22;
+      --bg-card-hover: #1c2330;
+      --border: #30363d;
+      --border-subtle: #21262d;
+      --text-primary: #e6edf3;
+      --text-secondary: #8b949e;
+      --text-muted: #484f58;
+      --accent: #7c3aed;
+      --accent-light: #a855f7;
+      --accent-glow: rgba(124, 58, 237, 0.35);
+      --green: #3fb950;
+      --blue: #58a6ff;
+      --orange: #f0883e;
+      --red: #f85149;
+      --yellow: #e3b341;
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 16px;
+      --radius-xl: 24px;
+      --font-sans: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      --font-mono: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+      --transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-base);
+      color: var(--text-primary);
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    ::selection {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    /* ============================================
+       SCROLLBAR
+    ============================================ */
+    ::-webkit-scrollbar {
+      width: 6px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: var(--bg-base);
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--border);
+      border-radius: 99px;
+    }
+
+    /* ============================================
+       UTILITY
+    ============================================ */
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    .section {
+      padding: 96px 0;
+    }
+
+    .section-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent-light);
+      background: rgba(124, 58, 237, 0.12);
+      border: 1px solid rgba(124, 58, 237, 0.25);
+      padding: 4px 12px;
+      border-radius: 99px;
+      margin-bottom: 20px;
+    }
+
+    .section-title {
+      font-size: clamp(28px, 4vw, 42px);
+      font-weight: 700;
+      color: var(--text-primary);
+      line-height: 1.2;
+      margin-bottom: 16px;
+    }
+
+    .section-subtitle {
+      font-size: 17px;
+      color: var(--text-secondary);
+      max-width: 560px;
+      line-height: 1.7;
+    }
+
+    .section-header {
+      text-align: center;
+      margin-bottom: 64px;
+    }
+
+    .section-header .section-subtitle {
+      margin: 0 auto;
+    }
+
+    .reveal {
+      opacity: 0;
+      transform: translateY(32px);
+      transition: opacity 0.6s var(--transition), transform 0.6s var(--transition);
+    }
+
+    .reveal.visible {
+      opacity: 1;
+      transform: none;
+    }
+
+    .reveal-delay-1 {
+      transition-delay: 0.1s;
+    }
+
+    .reveal-delay-2 {
+      transition-delay: 0.2s;
+    }
+
+    .reveal-delay-3 {
+      transition-delay: 0.3s;
+    }
+
+    .reveal-delay-4 {
+      transition-delay: 0.4s;
+    }
+
+    .reveal-delay-5 {
+      transition-delay: 0.5s;
+    }
+
+    /* ============================================
+       NAV
+    ============================================ */
+    nav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      background: rgba(10, 12, 16, 0.85);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border-bottom: 1px solid transparent;
+      transition: border-color var(--transition);
+    }
+
+    nav.scrolled {
+      border-bottom-color: var(--border-subtle);
+    }
+
+    .nav-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 60px;
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    .nav-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 16px;
+      color: var(--text-primary);
+      text-decoration: none;
+    }
+
+    .nav-logo-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: var(--radius-sm);
+      background: linear-gradient(135deg, var(--accent), var(--accent-light));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 32px;
+      list-style: none;
+    }
+
+    .nav-links a {
+      font-size: 14px;
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-weight: 500;
+      transition: color var(--transition);
+    }
+
+    .nav-links a:hover {
+      color: var(--text-primary);
+    }
+
+    .nav-cta {
+      background: var(--accent);
+      color: #fff;
+      padding: 8px 18px;
+      border-radius: var(--radius-sm);
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      transition: background var(--transition), transform var(--transition), box-shadow var(--transition);
+    }
+
+    .nav-cta:hover {
+      background: var(--accent-light);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 20px var(--accent-glow);
+    }
+
+    .nav-mobile-btn {
+      display: none;
+      background: none;
+      border: none;
+      color: var(--text-primary);
+      cursor: pointer;
+      font-size: 20px;
+    }
+
+    /* ============================================
+       HERO
+    ============================================ */
+    #hero {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      position: relative;
+      overflow: hidden;
+      padding: 120px 0 80px;
+    }
+
+    .hero-bg {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+
+    .hero-grid {
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(124, 58, 237, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(124, 58, 237, 0.04) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: radial-gradient(ellipse 80% 80% at 50% 50%, #000 30%, transparent 100%);
+    }
+
+    .hero-glow {
+      position: absolute;
+      width: 700px;
+      height: 700px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(124, 58, 237, 0.18) 0%, transparent 70%);
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -60%);
+      animation: pulsate 6s ease-in-out infinite;
+    }
+
+    .hero-orb {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(80px);
+      animation: drift 12s ease-in-out infinite;
+    }
+
+    .hero-orb-1 {
+      width: 300px;
+      height: 300px;
+      background: rgba(88, 166, 255, 0.12);
+      top: 20%;
+      left: -5%;
+      animation-delay: -4s;
+    }
+
+    .hero-orb-2 {
+      width: 250px;
+      height: 250px;
+      background: rgba(168, 85, 247, 0.14);
+      bottom: 10%;
+      right: -5%;
+      animation-delay: -8s;
+    }
+
+    @keyframes pulsate {
+
+      0%,
+      100% {
+        opacity: 0.6;
+        transform: translate(-50%, -60%) scale(1);
+      }
+
+      50% {
+        opacity: 1;
+        transform: translate(-50%, -60%) scale(1.1);
+      }
+    }
+
+    @keyframes drift {
+
+      0%,
+      100% {
+        transform: translateY(0) translateX(0);
+      }
+
+      33% {
+        transform: translateY(-30px) translateX(20px);
+      }
+
+      66% {
+        transform: translateY(20px) translateX(-15px);
+      }
+    }
+
+    .hero-content {
+      position: relative;
+      z-index: 2;
+      max-width: 760px;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(168, 85, 247, 0.1);
+      border: 1px solid rgba(168, 85, 247, 0.3);
+      color: var(--accent-light);
+      padding: 6px 14px;
+      border-radius: 99px;
+      font-size: 13px;
+      font-weight: 500;
+      margin-bottom: 28px;
+      animation: fadeSlideDown 0.7s ease both;
+    }
+
+    .hero-badge-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 8px var(--green);
+      animation: blink 1.5s ease-in-out infinite;
+    }
+
+    @keyframes blink {
+
+      0%,
+      100% {
+        opacity: 1;
+      }
+
+      50% {
+        opacity: 0.4;
+      }
+    }
+
+    @keyframes fadeSlideDown {
+      from {
+        opacity: 0;
+        transform: translateY(-20px);
+      }
+
+      to {
+        opacity: 1;
+        transform: none;
+      }
+    }
+
+    .hero-title {
+      font-size: clamp(40px, 7vw, 72px);
+      font-weight: 800;
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      margin-bottom: 24px;
+      animation: fadeSlideUp 0.8s 0.1s ease both;
+    }
+
+    .hero-title .gradient-text {
+      background: linear-gradient(135deg, #a855f7, #60a5fa, #a855f7);
+      background-size: 200%;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      animation: shimmer 4s linear infinite;
+    }
+
+    @keyframes shimmer {
+      0% {
+        background-position: 0% center;
+      }
+
+      100% {
+        background-position: 200% center;
+      }
+    }
+
+    @keyframes fadeSlideUp {
+      from {
+        opacity: 0;
+        transform: translateY(30px);
+      }
+
+      to {
+        opacity: 1;
+        transform: none;
+      }
+    }
+
+    .hero-desc {
+      font-size: 18px;
+      color: var(--text-secondary);
+      max-width: 580px;
+      line-height: 1.75;
+      margin-bottom: 40px;
+      animation: fadeSlideUp 0.8s 0.2s ease both;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      animation: fadeSlideUp 0.8s 0.3s ease both;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 28px;
+      border-radius: var(--radius-md);
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      border: none;
+      transition: all var(--transition);
+      outline: none;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent-light));
+      color: #fff;
+      box-shadow: 0 0 0 0 var(--accent-glow);
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 30px var(--accent-glow);
+    }
+
+    .btn-secondary {
+      background: var(--bg-card);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+    }
+
+    .btn-secondary:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--accent);
+      transform: translateY(-2px);
+    }
+
+    .hero-stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 40px;
+      margin-top: 64px;
+      animation: fadeSlideUp 0.8s 0.45s ease both;
+    }
+
+    .hero-stat-value {
+      font-size: 26px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .hero-stat-label {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+    }
+
+    .hero-floating-card {
+      position: absolute;
+      right: 48px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 24px;
+      width: 300px;
+      z-index: 2;
+      animation: floatCard 0.9s 0.5s ease both, floatY 6s 2s ease-in-out infinite;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.4);
+    }
+
+    @keyframes floatCard {
+      from {
+        opacity: 0;
+        transform: translateY(-40%) translateX(40px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(-50%);
+      }
+    }
+
+    @keyframes floatY {
+
+      0%,
+      100% {
+        transform: translateY(-50%);
+      }
+
+      50% {
+        transform: translateY(-53%);
+      }
+    }
+
+    .float-card-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      margin-bottom: 16px;
+    }
+
+    .float-card-title .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 8px var(--green);
+      animation: blink 1.5s ease-in-out infinite;
+    }
+
+    .float-agent {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      margin-bottom: 8px;
+    }
+
+    .float-agent-name {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .agent-icon {
+      width: 24px;
+      height: 24px;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+    }
+
+    .float-agent-score {
+      font-size: 12px;
+      font-family: var(--font-mono);
+      padding: 2px 8px;
+      border-radius: 4px;
+    }
+
+    .score-good {
+      background: rgba(63, 185, 80, 0.15);
+      color: var(--green);
+    }
+
+    .score-warn {
+      background: rgba(240, 136, 62, 0.15);
+      color: var(--orange);
+    }
+
+    .score-bad {
+      background: rgba(248, 81, 73, 0.15);
+      color: var(--red);
+    }
+
+    .float-consensus {
+      margin-top: 12px;
+      padding: 10px;
+      border-radius: var(--radius-sm);
+      background: rgba(124, 58, 237, 0.12);
+      border: 1px solid rgba(124, 58, 237, 0.25);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--accent-light);
+      font-weight: 600;
+    }
+
+    /* ============================================
+       HOW IT WORKS
+    ============================================ */
+    #how-it-works {
+      background: var(--bg-surface);
+    }
+
+    .flow-container {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      overflow-x: auto;
+      padding-bottom: 12px;
+    }
+
+    .flow-step {
+      flex: 1;
+      min-width: 160px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 24px 20px;
+      text-align: center;
+      position: relative;
+      transition: all var(--transition);
+    }
+
+    .flow-step:hover {
+      border-color: var(--accent);
+      background: var(--bg-card-hover);
+      transform: translateY(-4px);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+    }
+
+    .flow-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 4px;
+      color: var(--text-muted);
+      font-size: 20px;
+      flex-shrink: 0;
+      align-self: center;
+    }
+
+    .flow-step-icon {
+      width: 52px;
+      height: 52px;
+      border-radius: 50%;
+      background: rgba(124, 58, 237, 0.12);
+      border: 1px solid rgba(124, 58, 237, 0.25);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+      margin: 0 auto 16px;
+      transition: all var(--transition);
+    }
+
+    .flow-step:hover .flow-step-icon {
+      background: rgba(124, 58, 237, 0.25);
+      box-shadow: 0 0 20px var(--accent-glow);
+    }
+
+    .flow-step-num {
+      position: absolute;
+      top: -10px;
+      left: -10px;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #fff;
+      font-size: 11px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .flow-step-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .flow-step-desc {
+      font-size: 12px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    /* ============================================
+       FEATURES
+    ============================================ */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 20px;
+    }
+
+    .feature-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 28px;
+      transition: all var(--transition);
+      cursor: default;
+    }
+
+    .feature-card:hover {
+      border-color: var(--accent);
+      transform: translateY(-4px);
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(124, 58, 237, 0.15);
+      background: var(--bg-card-hover);
+    }
+
+    .feature-icon {
+      width: 48px;
+      height: 48px;
+      border-radius: var(--radius-md);
+      background: rgba(124, 58, 237, 0.12);
+      border: 1px solid rgba(124, 58, 237, 0.2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      margin-bottom: 18px;
+      transition: all var(--transition);
+    }
+
+    .feature-card:hover .feature-icon {
+      background: rgba(124, 58, 237, 0.22);
+      box-shadow: 0 0 16px var(--accent-glow);
+    }
+
+    .feature-title {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 10px;
+    }
+
+    .feature-desc {
+      font-size: 14px;
+      color: var(--text-secondary);
+      line-height: 1.6;
+    }
+
+    .feature-tag {
+      display: inline-block;
+      margin-top: 14px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: rgba(88, 166, 255, 0.1);
+      color: var(--blue);
+      border: 1px solid rgba(88, 166, 255, 0.2);
+    }
+
+    /* ============================================
+       LIVE EXAMPLE
+    ============================================ */
+    #live-example {
+      background: var(--bg-surface);
+    }
+
+    .example-layout {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+      align-items: start;
+    }
+
+    .code-window {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+    }
+
+    .code-window-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 16px;
+      background: var(--bg-card);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .window-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+    }
+
+    .dot-red {
+      background: #ff5f57;
+    }
+
+    .dot-yellow {
+      background: #febc2e;
+    }
+
+    .dot-green {
+      background: #28c840;
+    }
+
+    .code-window-title {
+      flex: 1;
+      text-align: center;
+      font-size: 12px;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    .code-body {
+      padding: 20px;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.7;
+      overflow-x: auto;
+    }
+
+    .diff-add {
+      color: var(--green);
+    }
+
+    .diff-remove {
+      color: var(--red);
+    }
+
+    .diff-ctx {
+      color: var(--text-muted);
+    }
+
+    .diff-line {
+      display: flex;
+      gap: 12px;
+    }
+
+    .diff-ln {
+      color: var(--text-muted);
+      user-select: none;
+      min-width: 20px;
+    }
+
+    .output-panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+    }
+
+    .output-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border-subtle);
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+
+    .output-header .badge {
+      background: rgba(248, 81, 73, 0.15);
+      color: var(--red);
+      border: 1px solid rgba(248, 81, 73, 0.2);
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 99px;
+      font-weight: 600;
+    }
+
+    .output-body {
+      padding: 16px;
+    }
+
+    .issue-item {
+      padding: 14px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border-subtle);
+      margin-bottom: 10px;
+      background: var(--bg-surface);
+      opacity: 0;
+      transform: translateX(20px);
+      transition: opacity 0.4s ease, transform 0.4s ease;
+    }
+
+    .issue-item.show {
+      opacity: 1;
+      transform: none;
+    }
+
+    .issue-item:last-child {
+      margin-bottom: 0;
+    }
+
+    .issue-type {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-bottom: 8px;
+    }
+
+    .issue-critical {
+      background: rgba(248, 81, 73, 0.12);
+      color: var(--red);
+    }
+
+    .issue-warn {
+      background: rgba(240, 136, 62, 0.12);
+      color: var(--orange);
+    }
+
+    .issue-info {
+      background: rgba(88, 166, 255, 0.12);
+      color: var(--blue);
+    }
+
+    .issue-text {
+      font-size: 13px;
+      color: var(--text-primary);
+      line-height: 1.5;
+    }
+
+    .issue-meta {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 6px;
+      font-family: var(--font-mono);
+    }
+
+    .risk-bar-container {
+      margin-top: 16px;
+    }
+
+    .risk-bar-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-bottom: 8px;
+    }
+
+    .risk-bar-track {
+      height: 6px;
+      background: var(--bg-surface);
+      border-radius: 99px;
+      overflow: hidden;
+    }
+
+    .risk-bar-fill {
+      height: 100%;
+      border-radius: 99px;
+      background: linear-gradient(90deg, var(--green), var(--yellow), var(--red));
+      width: 0%;
+      transition: width 1.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .consensus-line {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 16px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      margin-top: 16px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .consensus-agents {
+      display: flex;
+      gap: 6px;
+    }
+
+    .agent-pill {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 99px;
+    }
+
+    .pill-groq {
+      background: rgba(63, 185, 80, 0.15);
+      color: var(--green);
+    }
+
+    .pill-nvidia {
+      background: rgba(88, 166, 255, 0.15);
+      color: var(--blue);
+    }
+
+    .pill-gemini {
+      background: rgba(240, 136, 62, 0.15);
+      color: var(--orange);
+    }
+
+    /* ============================================
+       INSTALLATION
+    ============================================ */
+    .install-layout {
+      display: grid;
+      grid-template-columns: 1fr 1.2fr;
+      gap: 48px;
+      align-items: start;
+    }
+
+    .install-steps {
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    .install-step {
+      display: flex;
+      gap: 18px;
+      align-items: flex-start;
+    }
+
+    .install-step-num {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      background: linear-gradient(135deg, var(--accent), var(--accent-light));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      font-weight: 700;
+      color: #fff;
+      box-shadow: 0 0 0 4px rgba(124, 58, 237, 0.1);
+    }
+
+    .install-step-content {}
+
+    .install-step-title {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 6px;
+      color: var(--text-primary);
+    }
+
+    .install-step-desc {
+      font-size: 13px;
+      color: var(--text-secondary);
+      line-height: 1.6;
+    }
+
+    .install-code-panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+    }
+
+    .code-tab-bar {
+      display: flex;
+      border-bottom: 1px solid var(--border-subtle);
+      overflow-x: auto;
+    }
+
+    .code-tab {
+      padding: 12px 20px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-muted);
+      cursor: pointer;
+      white-space: nowrap;
+      border-bottom: 2px solid transparent;
+      transition: all var(--transition);
+    }
+
+    .code-tab.active {
+      color: var(--text-primary);
+      border-bottom-color: var(--accent);
+    }
+
+    .code-tab:hover:not(.active) {
+      color: var(--text-secondary);
+    }
+
+    .code-panel {
+      display: none;
+      padding: 20px;
+    }
+
+    .code-panel.active {
+      display: block;
+    }
+
+    .code-panel pre {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.75;
+      color: var(--text-secondary);
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .code-panel pre .cmd {
+      color: var(--blue);
+    }
+
+    .code-panel pre .key {
+      color: var(--accent-light);
+    }
+
+    .code-panel pre .val {
+      color: var(--green);
+    }
+
+    .code-panel pre .cmt {
+      color: var(--text-muted);
+      font-style: italic;
+    }
+
+    .code-panel pre .flag {
+      color: var(--orange);
+    }
+
+    .copy-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 16px;
+      padding: 8px 14px;
+      border-radius: var(--radius-sm);
+      background: rgba(124, 58, 237, 0.12);
+      border: 1px solid rgba(124, 58, 237, 0.25);
+      color: var(--accent-light);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all var(--transition);
+    }
+
+    .copy-btn:hover {
+      background: rgba(124, 58, 237, 0.22);
+    }
+
+    .install-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-top: 40px;
+    }
+
+    /* ============================================
+       FOOTER
+    ============================================ */
+    footer {
+      background: var(--bg-surface);
+      border-top: 1px solid var(--border-subtle);
+      padding: 48px 0;
+    }
+
+    .footer-inner {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 24px;
+      text-align: center;
+    }
+
+    .footer-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 18px;
+      color: var(--text-primary);
+    }
+
+    .footer-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 28px;
+      justify-content: center;
+    }
+
+    .footer-links a {
+      font-size: 14px;
+      color: var(--text-secondary);
+      text-decoration: none;
+      transition: color var(--transition);
+    }
+
+    .footer-links a:hover {
+      color: var(--accent-light);
+    }
+
+    .footer-divider {
+      width: 100%;
+      height: 1px;
+      background: var(--border-subtle);
+    }
+
+    .footer-bottom {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      justify-content: center;
+      font-size: 13px;
+      color: var(--text-muted);
+      align-items: center;
+    }
+
+    .footer-hackathon {
+      background: rgba(124, 58, 237, 0.1);
+      border: 1px solid rgba(124, 58, 237, 0.2);
+      color: var(--accent-light);
+      padding: 4px 12px;
+      border-radius: 99px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .footer-github-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 13px;
+      padding: 6px 14px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      transition: all var(--transition);
+    }
+
+    .footer-github-link:hover {
+      color: var(--text-primary);
+      border-color: var(--accent);
+      background: rgba(124, 58, 237, 0.08);
+    }
+
+    /* ============================================
+       RESPONSIVE
+    ============================================ */
+    @media (max-width: 900px) {
+      .hero-floating-card {
+        display: none;
+      }
+
+      .example-layout {
+        grid-template-columns: 1fr;
+      }
+
+      .install-layout {
+        grid-template-columns: 1fr;
+      }
+
+      .nav-links {
+        display: none;
+      }
+
+      .nav-mobile-btn {
+        display: block;
+      }
+
+      .flow-container {
+        gap: 0;
+      }
+
+      .flow-arrow {
+        padding: 0 2px;
+        font-size: 14px;
+      }
+    }
+
+    @media (max-width: 600px) {
+      .section {
+        padding: 64px 0;
+      }
+
+      .flow-step {
+        padding: 18px 12px;
+      }
+
+      .flow-step-title {
+        font-size: 12px;
+      }
+
+      .hero-stats {
+        gap: 24px;
+      }
+    }
+
+    /* ============================================
+       TYPEWRITER
+    ============================================ */
+    #typewriter-text {
+      display: inline;
+    }
+
+    .typewriter-cursor {
+      display: inline-block;
+      width: 2px;
+      height: 1em;
+      background: var(--accent-light);
+      vertical-align: middle;
+      margin-left: 2px;
+      animation: blink-cursor 0.8s step-end infinite;
+    }
+
+    @keyframes blink-cursor {
+
+      0%,
+      100% {
+        opacity: 1;
+      }
+
+      50% {
+        opacity: 0;
+      }
+    }
+
+    /* ============================================
+       MOBILE NAV PANEL
+    ============================================ */
+    .mobile-nav {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 99;
+      background: rgba(10, 12, 16, 0.97);
+      padding: 80px 24px 24px;
+      flex-direction: column;
+      gap: 32px;
+    }
+
+    .mobile-nav.open {
+      display: flex;
+    }
+
+    .mobile-nav a {
+      font-size: 24px;
+      font-weight: 600;
+      color: var(--text-primary);
+      text-decoration: none;
+      transition: color var(--transition);
+    }
+
+    .mobile-nav a:hover {
+      color: var(--accent-light);
+    }
+
+    /* ============================================
+       GLOW ON SCROLL ITEMS
+    ============================================ */
+    .glow-card-hover:hover {
+      box-shadow: 0 0 30px rgba(124, 58, 237, 0.2), 0 16px 40px rgba(0, 0, 0, 0.3);
+    }
+  </style>
+</head>
+
+<body>
+
+  <!-- ================================================
+     NAVIGATION
+================================================ -->
+  <nav id="main-nav">
+    <div class="nav-inner">
+      <a href="#hero" class="nav-logo" id="nav-logo">
+        <div class="nav-logo-icon">🤖</div>
+        <span>CodeCopilot</span>
+      </a>
+
+      <ul class="nav-links">
+        <li><a href="#how-it-works">How it Works</a></li>
+        <li><a href="#features">Features</a></li>
+        <li><a href="#live-example">Live Demo</a></li>
+        <li><a href="#get-started">Get Started</a></li>
+      </ul>
+
+      <a href="#get-started" class="nav-cta" id="nav-cta">Get Started →</a>
+      <button class="nav-mobile-btn" id="mobile-menu-btn" aria-label="Open menu">☰</button>
+    </div>
+  </nav>
+
+  <!-- Mobile nav panel -->
+  <div class="mobile-nav" id="mobile-nav">
+    <a href="#how-it-works" onclick="closeMobileNav()">How it Works</a>
+    <a href="#features" onclick="closeMobileNav()">Features</a>
+    <a href="#live-example" onclick="closeMobileNav()">Live Demo</a>
+    <a href="#get-started" onclick="closeMobileNav()">Get Started</a>
+    <a href="#get-started" onclick="closeMobileNav()" style="color:var(--accent-light)">→ Get Started</a>
+  </div>
+
+  <!-- ================================================
+     HERO
+================================================ -->
+  <section id="hero">
+    <div class="hero-bg">
+      <div class="hero-grid"></div>
+      <div class="hero-glow"></div>
+      <div class="hero-orb hero-orb-1"></div>
+      <div class="hero-orb hero-orb-2"></div>
+    </div>
+
+    <div class="container">
+      <div class="hero-content">
+        <div class="hero-badge">
+          <div class="hero-badge-dot"></div>
+          Multi-Agent AI · Now in Beta
+        </div>
+
+        <h1 class="hero-title">
+          <span id="typewriter-text"></span><span class="typewriter-cursor"></span><br />
+          <span class="gradient-text">Code Review Copilot</span>
+        </h1>
+
+        <p class="hero-desc">
+          Instant pull request analysis powered by a multi-LLM consensus engine.
+          Integrate with GitHub in minutes — let Groq, NVIDIA &amp; Gemini review your
+          code together, catching bugs humans miss.
+        </p>
+
+        <div class="hero-actions">
+          <a href="#get-started" class="btn btn-primary" id="hero-cta-primary">
+            🚀 Get Started
+          </a>
+          <a href="#live-example" class="btn btn-secondary" id="hero-cta-secondary">
+            ▶ View Demo
+          </a>
+        </div>
+
+        <div class="hero-stats">
+          <div>
+            <div class="hero-stat-value">3× LLMs</div>
+            <div class="hero-stat-label">Parallel analysis</div>
+          </div>
+          <div>
+            <div class="hero-stat-value">&lt; 30s</div>
+            <div class="hero-stat-label">Avg review time</div>
+          </div>
+          <div>
+            <div class="hero-stat-value">95%</div>
+            <div class="hero-stat-label">Consensus accuracy</div>
+          </div>
+          <div>
+            <div class="hero-stat-value">100%</div>
+            <div class="hero-stat-label">GitHub native</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Floating status card -->
+      <div class="hero-floating-card" id="hero-floating-card">
+        <div class="float-card-title">
+          <div class="status-dot"></div>
+          Live analysis — PR #142
+        </div>
+
+        <div class="float-agent">
+          <div class="float-agent-name">
+            <div class="agent-icon" style="background:rgba(63,185,80,0.15);">⚡</div>
+            Groq / Llama3
+          </div>
+          <div class="float-agent-score score-warn">Risk 62</div>
+        </div>
+
+        <div class="float-agent">
+          <div class="float-agent-name">
+            <div class="agent-icon" style="background:rgba(88,166,255,0.15);">🔷</div>
+            NVIDIA / Mixtral
+          </div>
+          <div class="float-agent-score score-good">Risk 48</div>
+        </div>
+
+        <div class="float-agent">
+          <div class="float-agent-name">
+            <div class="agent-icon" style="background:rgba(240,136,62,0.15);">💎</div>
+            Gemini Pro
+          </div>
+          <div class="float-agent-score score-warn">Risk 71</div>
+        </div>
+
+        <div class="float-consensus">
+          🔀 Consensus score: <strong style="color:#fff;margin-left:4px;">60 / 100</strong>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================
+     HOW IT WORKS
+================================================ -->
+  <section id="how-it-works" class="section">
+    <div class="container">
+      <div class="section-header">
+        <div class="section-label reveal">⚙️ Process</div>
+        <h2 class="section-title reveal">How it Works</h2>
+        <p class="section-subtitle reveal">
+          From a pushed commit to an intelligent GitHub comment in seconds.
+          Five automated steps — zero human bottleneck.
+        </p>
+      </div>
+
+      <div class="flow-container">
+        <!-- Step 1 -->
+        <div class="flow-step reveal reveal-delay-1">
+          <div class="flow-step-num">1</div>
+          <div class="flow-step-icon">📤</div>
+          <div class="flow-step-title">PR Created</div>
+          <div class="flow-step-desc">Developer opens a pull request on GitHub</div>
+        </div>
+        <div class="flow-arrow">→</div>
+        <!-- Step 2 -->
+        <div class="flow-step reveal reveal-delay-2">
+          <div class="flow-step-num">2</div>
+          <div class="flow-step-icon">🪝</div>
+          <div class="flow-step-title">Webhook Triggered</div>
+          <div class="flow-step-desc">GitHub fires a webhook to the backend service</div>
+        </div>
+        <div class="flow-arrow">→</div>
+        <!-- Step 3 -->
+        <div class="flow-step reveal reveal-delay-3">
+          <div class="flow-step-num">3</div>
+          <div class="flow-step-icon">🤖</div>
+          <div class="flow-step-title">Multi-LLM Analysis</div>
+          <div class="flow-step-desc">Groq, NVIDIA &amp; Gemini review in parallel</div>
+        </div>
+        <div class="flow-arrow">→</div>
+        <!-- Step 4 -->
+        <div class="flow-step reveal reveal-delay-4">
+          <div class="flow-step-num">4</div>
+          <div class="flow-step-icon">🔀</div>
+          <div class="flow-step-title">Consensus Engine</div>
+          <div class="flow-step-desc">Results are merged &amp; deduplicated by severity</div>
+        </div>
+        <div class="flow-arrow">→</div>
+        <!-- Step 5 -->
+        <div class="flow-step reveal reveal-delay-5">
+          <div class="flow-step-num">5</div>
+          <div class="flow-step-icon">💬</div>
+          <div class="flow-step-title">Auto-Comment</div>
+          <div class="flow-step-desc">Inline comments posted directly on the PR diff</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================
+     FEATURES
+================================================ -->
+  <section id="features" class="section">
+    <div class="container">
+      <div class="section-header">
+        <div class="section-label reveal">✨ Features</div>
+        <h2 class="section-title reveal">Everything you need for smarter PRs</h2>
+        <p class="section-subtitle reveal">
+          A purpose-built multi-agent pipeline designed to catch what
+          single-model reviews miss.
+        </p>
+      </div>
+
+      <div class="features-grid">
+        <div class="feature-card glow-card-hover reveal reveal-delay-1">
+          <div class="feature-icon">🧠</div>
+          <div class="feature-title">Multi-LLM Ensemble</div>
+          <div class="feature-desc">
+            Groq (Llama 3), NVIDIA (Mixtral), and Gemini Pro run in parallel,
+            each providing an independent analysis of your code diff.
+          </div>
+          <div class="feature-tag">Groq · NVIDIA · Gemini</div>
+        </div>
+
+        <div class="feature-card glow-card-hover reveal reveal-delay-2">
+          <div class="feature-icon">🔀</div>
+          <div class="feature-title">Consensus Engine</div>
+          <div class="feature-desc">
+            Issues flagged by multiple agents are ranked higher. Noise is
+            reduced. Only actionable feedback reaches your PR.
+          </div>
+          <div class="feature-tag">Weighted voting</div>
+        </div>
+
+        <div class="feature-card glow-card-hover reveal reveal-delay-3">
+          <div class="feature-icon">💬</div>
+          <div class="feature-title">Inline PR Comments</div>
+          <div class="feature-desc">
+            Comments are posted directly on the relevant lines of your GitHub
+            diff, keeping context intact for the reviewer.
+          </div>
+          <div class="feature-tag">GitHub API v4</div>
+        </div>
+
+        <div class="feature-card glow-card-hover reveal reveal-delay-4">
+          <div class="feature-icon">🎯</div>
+          <div class="feature-title">Risk Scoring</div>
+          <div class="feature-desc">
+            Each PR receives a composite risk score (0–100) based on severity
+            and frequency of detected issues across all agents.
+          </div>
+          <div class="feature-tag">0–100 scale</div>
+        </div>
+
+        <div class="feature-card glow-card-hover reveal reveal-delay-5">
+          <div class="feature-icon">⚡</div>
+          <div class="feature-title">Fast Feedback Loop</div>
+          <div class="feature-desc">
+            Parallel LLM calls and async webhooks keep total latency under
+            30 seconds — even for large diffs.
+          </div>
+          <div class="feature-tag">&lt; 30s turnaround</div>
+        </div>
+
+        <div class="feature-card glow-card-hover reveal reveal-delay-1">
+          <div class="feature-icon">🔒</div>
+          <div class="feature-title">Secure by Design</div>
+          <div class="feature-desc">
+            API keys are stored as secrets. Code diffs never leave your
+            configured cloud endpoints. HTTPS everywhere.
+          </div>
+          <div class="feature-tag">Secrets management</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================
+     LIVE EXAMPLE
+================================================ -->
+  <section id="live-example" class="section">
+    <div class="container">
+      <div class="section-header">
+        <div class="section-label reveal">🎬 Live Example</div>
+        <h2 class="section-title reveal">See it in action</h2>
+        <p class="section-subtitle reveal">
+          A real Python diff submitted to the system — watch the agents surface
+          issues in real-time.
+        </p>
+      </div>
+
+      <div class="example-layout">
+        <!-- Code diff -->
+        <div class="code-window reveal reveal-delay-1">
+          <div class="code-window-bar">
+            <div class="window-dot dot-red"></div>
+            <div class="window-dot dot-yellow"></div>
+            <div class="window-dot dot-green"></div>
+            <div class="code-window-title">auth.py — diff</div>
+          </div>
+          <div class="code-body">
+            <div class="diff-line"><span class="diff-ln">1</span><span class="diff-ctx"> def authenticate_user(username,
+                password):</span></div>
+            <div class="diff-line"><span class="diff-ln">2</span><span class="diff-ctx"> db = connect_to_db()</span>
+            </div>
+            <div class="diff-line"><span class="diff-ln">3</span><span class="diff-remove">- query = f"SELECT * FROM
+                users WHERE</span></div>
+            <div class="diff-line"><span class="diff-ln">4</span><span class="diff-remove">- username='{username}'
+                AND</span></div>
+            <div class="diff-line"><span class="diff-ln">5</span><span class="diff-remove">-
+                password='{password}'"</span></div>
+            <div class="diff-line"><span class="diff-ln">6</span><span class="diff-add">+ query = "SELECT * FROM users
+                WHERE</span></div>
+            <div class="diff-line"><span class="diff-ln">7</span><span class="diff-add">+ username=? AND
+                password=?"</span></div>
+            <div class="diff-line"><span class="diff-ln">8</span><span class="diff-ctx"> result =
+                db.execute(query)</span></div>
+            <div class="diff-line"><span class="diff-ln">9</span><span class="diff-remove">- if result:</span></div>
+            <div class="diff-line"><span class="diff-ln">10</span><span class="diff-add">+ if result and len(result) >
+                0:</span></div>
+            <div class="diff-line"><span class="diff-ln">11</span><span class="diff-ctx"> session['user'] =
+                username</span></div>
+            <div class="diff-line"><span class="diff-ln">12</span><span class="diff-remove">- log.info(f"Login:
+                {username}:{password}")</span></div>
+            <div class="diff-line"><span class="diff-ln">13</span><span class="diff-add">+ log.info(f"Login success:
+                {username}")</span></div>
+            <div class="diff-line"><span class="diff-ln">14</span><span class="diff-ctx"> return True</span></div>
+            <div class="diff-line"><span class="diff-ln">15</span><span class="diff-ctx"> return False</span></div>
+          </div>
+        </div>
+
+        <!-- Output panel -->
+        <div class="output-panel reveal reveal-delay-2">
+          <div class="output-header">
+            🔍 Issues Detected
+            <span class="badge">3 found</span>
+          </div>
+          <div class="output-body">
+            <div class="issue-item" id="issue-1">
+              <div class="issue-type issue-critical">🚨 Critical</div>
+              <div class="issue-text">
+                <strong>SQL Injection vulnerability.</strong> Removed f-string
+                interpolation is correct, but parameterised query bindings are
+                missing the actual parameter tuple — db.execute(query) must be
+                db.execute(query, (username, password)).
+              </div>
+              <div class="issue-meta">line 8 · flagged by Groq + Gemini</div>
+            </div>
+
+            <div class="issue-item" id="issue-2">
+              <div class="issue-type issue-warn">⚠️ Warning</div>
+              <div class="issue-text">
+                <strong>Password logged in removed line.</strong> Old code
+                logged raw credentials. Verify no log rotation exposes them
+                in existing log files before this PR merges.
+              </div>
+              <div class="issue-meta">line 12 · flagged by all 3 agents</div>
+            </div>
+
+            <div class="issue-item" id="issue-3">
+              <div class="issue-type issue-info">ℹ️ Suggestion</div>
+              <div class="issue-text">
+                <strong>Redundant length check.</strong> if result already
+                handles falsy empty lists. len(result) > 0 is unnecessary
+                and slightly less readable.
+              </div>
+              <div class="issue-meta">line 10 · flagged by NVIDIA</div>
+            </div>
+
+            <!-- Risk bar -->
+            <div class="risk-bar-container">
+              <div class="risk-bar-label">
+                <span>Risk Score</span>
+                <span id="risk-score-val" style="color:var(--orange);font-weight:700;">72 / 100</span>
+              </div>
+              <div class="risk-bar-track">
+                <div class="risk-bar-fill" id="risk-bar-fill"></div>
+              </div>
+            </div>
+
+            <!-- Consensus line -->
+            <div class="consensus-line">
+              Consensus from
+              <div class="consensus-agents">
+                <span class="agent-pill pill-groq">Groq</span>
+                <span class="agent-pill pill-nvidia">NVIDIA</span>
+                <span class="agent-pill pill-gemini">Gemini</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================
+     GET STARTED / INSTALLATION
+================================================ -->
+  <section id="get-started" class="section" style="background:var(--bg-surface);">
+    <div class="container">
+      <div class="section-header">
+        <div class="section-label reveal">🚀 Setup</div>
+        <h2 class="section-title reveal">Up and running in 4 steps</h2>
+        <p class="section-subtitle reveal">
+          Self-host on any server with Python 3.10+. One webhook, three API
+          keys, and you're live.
+        </p>
+      </div>
+
+      <div class="install-layout">
+        <!-- Steps -->
+        <div class="install-steps">
+          <div class="install-step reveal reveal-delay-1">
+            <div class="install-step-num">1</div>
+            <div class="install-step-content">
+              <div class="install-step-title">Clone the repository</div>
+              <div class="install-step-desc">
+                Grab the source from GitHub. No build step required — pure Python
+                backend with a minimal dependencies file.
+              </div>
+            </div>
+          </div>
+          <div class="install-step reveal reveal-delay-2">
+            <div class="install-step-num">2</div>
+            <div class="install-step-content">
+              <div class="install-step-title">Add your API keys</div>
+              <div class="install-step-desc">
+                Copy <code style="color:var(--blue);font-family:var(--font-mono)">.env.example</code> to
+                <code style="color:var(--blue);font-family:var(--font-mono)">.env</code> and
+                fill in your Groq, NVIDIA, Gemini, and GitHub token values.
+              </div>
+            </div>
+          </div>
+          <div class="install-step reveal reveal-delay-3">
+            <div class="install-step-num">3</div>
+            <div class="install-step-content">
+              <div class="install-step-title">Run the backend</div>
+              <div class="install-step-desc">
+                Start the FastAPI server locally or deploy to any cloud. Use
+                ngrok or a reverse-proxy for local webhook development.
+              </div>
+            </div>
+          </div>
+          <div class="install-step reveal reveal-delay-4">
+            <div class="install-step-num">4</div>
+            <div class="install-step-content">
+              <div class="install-step-title">Configure GitHub Webhook</div>
+              <div class="install-step-desc">
+                In your repo Settings → Webhooks, point the URL to your server's
+                <code style="color:var(--blue);font-family:var(--font-mono)">/webhook</code>
+                endpoint and select "Pull requests" events.
+              </div>
+            </div>
+          </div>
+
+          <div class="install-actions reveal">
+            <a href="https://github.com/" target="_blank" rel="noopener" class="btn btn-primary" id="github-repo-btn">
+              ⭐ Go to GitHub Repo
+            </a>
+            <a href="#live-example" class="btn btn-secondary">📺 View Demo</a>
+          </div>
+        </div>
+
+        <!-- Code panel -->
+        <div class="install-code-panel reveal reveal-delay-2">
+          <div class="code-tab-bar">
+            <div class="code-tab active" onclick="showTab('clone')" id="tab-clone">Clone</div>
+            <div class="code-tab" onclick="showTab('env')" id="tab-env">.env</div>
+            <div class="code-tab" onclick="showTab('run')" id="tab-run">Run</div>
+            <div class="code-tab" onclick="showTab('webhook')" id="tab-webhook">Webhook</div>
+          </div>
+
+          <div class="code-panel active" id="panel-clone">
+            <pre><span class="cmt"># Clone the repository</span>
+<span class="cmd">git</span> clone https://github.com/your-team/ai-code-review-copilot.git
+
+<span class="cmd">cd</span> ai-code-review-copilot
+
+<span class="cmt"># Install dependencies</span>
+<span class="cmd">pip</span> install <span class="flag">-r</span> requirements.txt</pre>
+            <button class="copy-btn" onclick="copyCode('clone')" id="copy-clone">📋 Copy</button>
+          </div>
+
+          <div class="code-panel" id="panel-env">
+            <pre><span class="cmt"># Copy the example env file</span>
+<span class="cmd">cp</span> .env.example .env
+
+<span class="cmt"># .env — fill in your keys</span>
+<span class="key">GROQ_API_KEY</span>=<span class="val">gsk_xxxxxxxxxxxxxxxxxxxx</span>
+<span class="key">NVIDIA_API_KEY</span>=<span class="val">nvapi-xxxxxxxxxxxxxxxxxxxx</span>
+<span class="key">GEMINI_API_KEY</span>=<span class="val">AIzaxxxxxxxxxxxxxxxxxxxxxxxx</span>
+<span class="key">GITHUB_TOKEN</span>=<span class="val">ghp_xxxxxxxxxxxxxxxxxxxx</span>
+<span class="key">WEBHOOK_SECRET</span>=<span class="val">your_webhook_secret</span></pre>
+            <button class="copy-btn" onclick="copyCode('env')" id="copy-env">📋 Copy</button>
+          </div>
+
+          <div class="code-panel" id="panel-run">
+            <pre><span class="cmt"># Start the FastAPI backend</span>
+<span class="cmd">uvicorn</span> app.main:app <span class="flag">--reload</span> <span class="flag">--port</span> 8000
+
+<span class="cmt"># Expose locally via ngrok (optional)</span>
+<span class="cmd">ngrok</span> http 8000
+
+<span class="cmt"># Server will be available at:</span>
+<span class="val">https://&lt;your-ngrok-id&gt;.ngrok.io</span></pre>
+            <button class="copy-btn" onclick="copyCode('run')" id="copy-run">📋 Copy</button>
+          </div>
+
+          <div class="code-panel" id="panel-webhook">
+            <pre><span class="cmt"># GitHub Webhook settings</span>
+<span class="key">Payload URL:</span>  <span class="val">https://your-server.com/webhook</span>
+<span class="key">Content type:</span> <span class="val">application/json</span>
+<span class="key">Secret:</span>        <span class="val">your_webhook_secret</span>
+
+<span class="cmt"># Events to subscribe to:</span>
+<span class="val">✓</span> Pull requests
+<span class="val">✓</span> Pull request reviews</pre>
+            <button class="copy-btn" onclick="copyCode('webhook')" id="copy-webhook">📋 Copy</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================
+     FOOTER
+================================================ -->
+  <footer>
+    <div class="container">
+      <div class="footer-inner">
+        <div class="footer-logo">
+          <div class="nav-logo-icon">🤖</div>
+          AI Code Review Copilot
+        </div>
+
+        <div class="footer-links">
+          <a href="#how-it-works">How it Works</a>
+          <a href="#features">Features</a>
+          <a href="#live-example">Live Demo</a>
+          <a href="#get-started">Get Started</a>
+          <a href="https://github.com/" target="_blank" rel="noopener">GitHub</a>
+        </div>
+
+        <div class="footer-divider"></div>
+
+        <div class="footer-bottom">
+          <span>Built by <strong style="color:var(--text-primary)">Team DAMM</strong></span>
+          <span>·</span>
+          <span class="footer-hackathon">🏆 SolarisX 2026</span>
+          <span>·</span>
+          <a href="https://github.com/" target="_blank" rel="noopener" class="footer-github-link"
+            id="footer-github-link">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+              <path
+                d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z" />
+            </svg>
+            View on GitHub
+          </a>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <!-- ================================================
+     JAVASCRIPT
+================================================ -->
+  <script>
+    /* -------------------------------------------
+       TYPEWRITER
+    ------------------------------------------- */
+    const phrases = ["AI-Powered", "Instant", "Multi-Agent"];
+    let phraseIdx = 0, charIdx = 0, deleting = false;
+    const el = document.getElementById('typewriter-text');
+
+    function typewrite() {
+      const phrase = phrases[phraseIdx];
+      if (!deleting) {
+        el.textContent = phrase.slice(0, ++charIdx);
+        if (charIdx === phrase.length) {
+          deleting = true;
+          setTimeout(typewrite, 2000);
+          return;
+        }
+      } else {
+        el.textContent = phrase.slice(0, --charIdx);
+        if (charIdx === 0) {
+          deleting = false;
+          phraseIdx = (phraseIdx + 1) % phrases.length;
+          setTimeout(typewrite, 300);
+          return;
+        }
+      }
+      setTimeout(typewrite, deleting ? 60 : 90);
+    }
+    typewrite();
+
+    /* -------------------------------------------
+       SCROLL REVEAL
+    ------------------------------------------- */
+    const revealEls = document.querySelectorAll('.reveal');
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          e.target.classList.add('visible');
+          observer.unobserve(e.target);
+        }
+      });
+    }, { threshold: 0.12 });
+    revealEls.forEach(el => observer.observe(el));
+
+    /* -------------------------------------------
+       NAV SCROLL STATE
+    ------------------------------------------- */
+    const nav = document.getElementById('main-nav');
+    window.addEventListener('scroll', () => {
+      nav.classList.toggle('scrolled', window.scrollY > 20);
+    });
+
+    /* -------------------------------------------
+       MOBILE NAV
+    ------------------------------------------- */
+    const mobileNav = document.getElementById('mobile-nav');
+    document.getElementById('mobile-menu-btn').addEventListener('click', () => {
+      mobileNav.classList.toggle('open');
+    });
+    function closeMobileNav() { mobileNav.classList.remove('open'); }
+    mobileNav.addEventListener('click', (e) => {
+      if (e.target === mobileNav) closeMobileNav();
+    });
+
+    /* -------------------------------------------
+       CODE TABS
+    ------------------------------------------- */
+    function showTab(name) {
+      document.querySelectorAll('.code-tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.code-panel').forEach(p => p.classList.remove('active'));
+      document.getElementById('tab-' + name).classList.add('active');
+      document.getElementById('panel-' + name).classList.add('active');
+    }
+
+    /* -------------------------------------------
+       COPY BUTTON
+    ------------------------------------------- */
+    const codeTexts = {
+      clone: `git clone https://github.com/your-team/ai-code-review-copilot.git\ncd ai-code-review-copilot\npip install -r requirements.txt`,
+      env: `GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxx\nNVIDIA_API_KEY=nvapi-xxxxxxxxxxxxxxxxxxxx\nGEMINI_API_KEY=AIzaxxxxxxxxxxxxxxxxxxxxxxxx\nGITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx\nWEBHOOK_SECRET=your_webhook_secret`,
+      run: `uvicorn app.main:app --reload --port 8000`,
+      webhook: `Payload URL: https://your-server.com/webhook\nContent type: application/json\nSecret: your_webhook_secret`,
+    };
+    function copyCode(name) {
+      navigator.clipboard.writeText(codeTexts[name]).then(() => {
+        const btn = document.getElementById('copy-' + name);
+        btn.textContent = '✅ Copied!';
+        setTimeout(() => btn.textContent = '📋 Copy', 2000);
+      });
+    }
+
+    /* -------------------------------------------
+       LIVE EXAMPLE ANIMATION
+    ------------------------------------------- */
+    const exampleSection = document.getElementById('live-example');
+    let issuesTriggered = false;
+
+    const exampleObserver = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting && !issuesTriggered) {
+        issuesTriggered = true;
+        [1, 2, 3].forEach((n, i) => {
+          setTimeout(() => {
+            const el = document.getElementById('issue-' + n);
+            if (el) el.classList.add('show');
+          }, 500 + i * 400);
+        });
+
+        // Animate risk bar
+        setTimeout(() => {
+          const fill = document.getElementById('risk-bar-fill');
+          if (fill) fill.style.width = '72%';
+        }, 1800);
+      }
+    }, { threshold: 0.3 });
+    exampleObserver.observe(exampleSection);
+
+    /* -------------------------------------------
+       SMOOTH SCROLL FOR SAME-PAGE LINKS
+    ------------------------------------------- */
+    document.querySelectorAll('a[href^="#"]').forEach(a => {
+      a.addEventListener('click', e => {
+        const target = document.querySelector(a.getAttribute('href'));
+        if (target) {
+          e.preventDefault();
+          target.scrollIntoView({ behavior: 'smooth' });
+        }
+      });
+    });
+  </script>
+</body>
+
+</html>
