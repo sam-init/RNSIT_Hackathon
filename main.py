@@ -1,100 +1,64 @@
-# processor.py
+# main.py
 import os
-import httpx
+import hmac
+import hashlib
 import logging
+from fastapi import FastAPI, Request, Header, HTTPException
+from concurrent.futures import ThreadPoolExecutor
 
-from security import SecurityScanner
+from processor import process_pr_event
 
+# ─────────────────────────────────────────────
+# Setup
+# ─────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("processor")
+logger = logging.getLogger("main")
 
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+app = FastAPI()  # ✅ REQUIRED FOR UVICORN
 
-
-# ─────────────────────────────────────────────
-# Get Diff (FIXED ✅)
-# ─────────────────────────────────────────────
-def get_diff(repo, pr_number):
-    url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
-
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3.diff",
-    }
-
-    logger.info(f"🌐 Fetching diff from API: {url}")
-
-    response = httpx.get(url, headers=headers)
-
-    if response.status_code != 200:
-        logger.error(f"❌ Diff fetch failed: {response.text}")
-        return ""
-
-    logger.info(f"✅ Diff fetched ({len(response.text)} chars)")
-    return response.text
+WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"].encode()
+executor = ThreadPoolExecutor(max_workers=4)
 
 
 # ─────────────────────────────────────────────
-# Post Review
+# Signature Verification
 # ─────────────────────────────────────────────
-def post_review(repo, pr_number, commit_id, comments):
-    url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/reviews"
-
-    payload = {
-        "commit_id": commit_id,
-        "event": "COMMENT",
-        "comments": [c.to_github_payload() for c in comments],
-    }
-
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
-
-    logger.info(f"📤 Posting {len(comments)} comments")
-
-    response = httpx.post(url, json=payload, headers=headers)
-
-    if response.status_code not in [200, 201]:
-        logger.error(f"❌ GitHub error: {response.text}")
-    else:
-        logger.info("✅ Review posted")
-
-
-# ─────────────────────────────────────────────
-# PROCESSOR (MAIN LOGIC)
-# ─────────────────────────────────────────────
-def process_pr_event(payload):
-    logger.info("🔍 Processing PR")
+def verify_signature(body: bytes, signature: str):
+    if not signature:
+        raise HTTPException(403, "Missing signature")
 
     try:
-        pr = payload["pull_request"]
+        sha_name, sig = signature.split("=")
+    except Exception:
+        raise HTTPException(403, "Invalid signature format")
 
-        repo = payload["repository"]["full_name"]
-        pr_number = pr["number"]
-        commit_id = pr["head"]["sha"]
+    mac = hmac.new(WEBHOOK_SECRET, msg=body, digestmod=hashlib.sha256)
 
-        logger.info(f"📦 Repo: {repo}")
-        logger.info(f"🔢 PR: {pr_number}")
+    if not hmac.compare_digest(mac.hexdigest(), sig):
+        raise HTTPException(403, "Invalid signature")
 
-        # ✅ FIXED DIFF FETCH
-        diff = get_diff(repo, pr_number)
 
-        if not diff:
-            logger.warning("⚠️ Empty diff")
-            return
+# ─────────────────────────────────────────────
+# Webhook Endpoint
+# ─────────────────────────────────────────────
+@app.post("/webhook")
+async def webhook(
+    request: Request,
+    x_hub_signature_256: str = Header(None),
+):
+    logger.info("📩 Webhook received")
 
-        logger.info(f"📄 Diff preview:\n{diff[:300]}")
+    body = await request.body()
 
-        # Run Security Agent
-        comments = SecurityScanner.scan(diff)
+    verify_signature(body, x_hub_signature_256)
 
-        logger.info(f"🧠 Found {len(comments)} issues")
+    payload = await request.json()
+    action = payload.get("action")
 
-        if comments:
-            post_review(repo, pr_number, commit_id, comments)
-        else:
-            logger.info("✅ No issues found")
+    logger.info(f"Action: {action}")
 
-    except Exception as e:
-        logger.error(f"🔥 Error: {e}")
+    if action in ["opened", "synchronize"]:
+        logger.info("Sending PR to processor")
+        executor.submit(process_pr_event, payload)
+
+    return {"status": "ok"}
