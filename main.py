@@ -98,16 +98,91 @@ def process_pr(payload):
             "Accept": "application/vnd.github+json"
         }
 
-        print("📤 Sending comment to GitHub...")
+        # 🔥 STEP 1: Fetch PR files
+        files_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files"
 
-        response = requests.post(url, json={"body": comment}, headers=headers)
+        print("📥 Fetching PR files...")
+        response = requests.get(files_url, headers=headers)
 
-        print(f"📡 GitHub Response Status: {response.status_code}")
-        print(f"📡 GitHub Response Body: {response.text}")
+        print(f"📡 Files API Status: {response.status_code}")
 
-        if response.status_code != 201:
-            print("❌ Failed to post comment")
+        if response.status_code != 200:
+            print("❌ Failed to fetch PR files")
+            print(response.text)
+            return
 
+        files = response.json()
+        print(f"📄 Total files changed: {len(files)}")
+
+        issues = []
+        all_changes = ""
+
+        # 🔥 STEP 2: Analyze changes using WhiteRabbitNeo
+        for file in files:
+            filename = file["filename"]
+            patch = file.get("patch", "")
+
+            print(f"\n📁 File: {filename}")
+            print(f"✏️ Changes:\n{patch[:300]}")
+
+            all_changes += f"\nFile: {filename}\n{patch}\n"
+
+            if not patch:
+                continue
+
+            # 🤖 LLM-powered cybersecurity analysis
+            llm_result = analyze_with_llm(filename, patch)
+
+            if llm_result and "NO_ISSUES" not in llm_result.upper():
+                issues.append({
+                    "file": filename,
+                    "line": 1,  # GitHub requires a valid line; LLM gives context in body
+                    "message": f"🛡️ **WhiteRabbitNeo Security Review**\n\n{llm_result}"
+                })
+
+        # 🔥 STEP 3: Post INLINE comments
+        inline_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/comments"
+
+        for issue in issues:
+            print(f"📌 Posting inline comment on {issue['file']}")
+
+            data = {
+                "body": issue["message"],
+                "commit_id": commit_id,
+                "path": issue["file"],
+                "line": issue["line"]
+            }
+
+            res = requests.post(inline_url, json=data, headers=headers)
+
+            print(f"📡 Inline Status: {res.status_code}")
+            print(res.text)
+
+        # 🔥 STEP 4: Summary comment
+        summary = f"""
+## 🤖 AI Review Summary (WhiteRabbitNeo V3 7B)
+
+- Files changed: {len(files)}
+- Issues found: {len(issues)}
+
+"""
+
+        if len(issues) == 0:
+            summary += "✅ No major security issues detected."
+        else:
+            summary += "⚠️ Security issues detected. Check inline comments for details."
+
+        summary_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
+
+        print("📤 Posting summary comment...")
+
+        res = requests.post(summary_url, json={"body": summary}, headers=headers)
+
+        print(f"📡 Summary Status: {res.status_code}")
+        print(res.text)
+
+        if res.status_code == 201:
+            print("✅ Summary posted successfully")
         else:
             print("❌ Failed to post summary")
 
