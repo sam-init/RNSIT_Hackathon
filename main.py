@@ -46,32 +46,70 @@ def process_pr(payload):
     try:
         pr = payload["pull_request"]
         repo = payload["repository"]["full_name"]
-        issue_number = pr["number"]
+        pr_number = pr["number"]
 
         print(f"📦 Repo: {repo}")
-        print(f"🔢 PR Number: {issue_number}")
+        print(f"🔢 PR Number: {pr_number}")
 
-        comment = "✅ AI Review Started..."
-
-        url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments"
+        # 🔥 STEP 1: Fetch PR files (diff)
+        files_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files"
 
         headers = {
             "Authorization": f"Bearer {GITHUB_TOKEN}",
             "Accept": "application/vnd.github+json"
         }
 
-        print("📤 Sending comment to GitHub...")
+        print("📥 Fetching PR files...")
 
-        response = requests.post(url, json={"body": comment}, headers=headers)
+        response = requests.get(files_url, headers=headers)
 
-        print(f"📡 GitHub Response Status: {response.status_code}")
-        print(f"📡 GitHub Response Body: {response.text}")
+        print(f"📡 Files API Status: {response.status_code}")
 
-        if response.status_code != 201:
-            print("❌ Failed to post comment")
+        if response.status_code != 200:
+            print("❌ Failed to fetch PR files")
+            print(response.text)
+            return
 
+        files = response.json()
+
+        print(f"📄 Total files changed: {len(files)}")
+
+        # 🔥 STEP 2: Extract changes
+        all_changes = ""
+
+        for file in files:
+            filename = file["filename"]
+            patch = file.get("patch", "")
+
+            print(f"\n📁 File: {filename}")
+            print(f"✏️ Changes:\n{patch[:500]}")  # preview
+
+            all_changes += f"\nFile: {filename}\n{patch}\n"
+
+        # 🔥 STEP 3: (Temporary AI simulation)
+        if "password" in all_changes.lower():
+            review = "🔴 Potential security issue: hardcoded password detected."
         else:
+            review = "✅ No obvious issues detected."
+
+        # 🔥 STEP 4: Post comment
+        comment_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
+
+        print("📤 Sending review comment...")
+
+        response = requests.post(
+            comment_url,
+            json={"body": review},
+            headers=headers
+        )
+
+        print(f"📡 Comment Status: {response.status_code}")
+        print(f"📡 Response: {response.text}")
+
+        if response.status_code == 201:
             print("✅ Comment posted successfully")
+        else:
+            print("❌ Failed to post comment")
 
     except Exception as e:
         print(f"🔥 Error in process_pr: {str(e)}")
@@ -98,7 +136,7 @@ async def webhook(request: Request):
         action = payload.get("action")
         print(f"⚡ Action: {action}")
 
-        if action == "opened":
+        if action in ["opened", "synchronize", "reopened"]:
             print("🟢 PR Opened → Starting background job")
             Thread(target=process_pr, args=(payload,)).start()
         else:
