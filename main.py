@@ -16,7 +16,7 @@ logger = logging.getLogger("main")
 
 app = FastAPI()
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"].encode()
 
 executor = ThreadPoolExecutor(max_workers=4)

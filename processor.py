@@ -3,7 +3,7 @@ import httpx
 import os
 import logging
 
-from ai_agent import SecurityScanner
+from security import SecurityScanner
 
 # ─────────────────────────────────────────────
 # Logging Setup
