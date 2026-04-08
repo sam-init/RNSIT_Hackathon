@@ -73,28 +73,54 @@ def llm_analysis(code):
         return []
 
     try:
-        res = httpx.post(
-            "https://api.openai.com/v1/chat/completions",
+        response = httpx.post(
+            "https://integrate.api.nvidia.com/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {LLM_API_KEY}",
                 "Content-Type": "application/json",
             },
             json={
-                "model": "gpt-4o-mini",
+                "model": "meta/llama-3.1-8b-instruct",  # ✅ NVIDIA model
                 "messages": [
-                    {"role": "system", "content": "Return ONLY JSON"},
-                    {"role": "user", "content": f"Find security issues:\n{code}"}
+                    {
+                        "role": "system",
+                        "content": "You are a security code reviewer. Return ONLY JSON."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"""
+Analyze this code for security vulnerabilities.
+
+Return JSON:
+[
+  {{
+    "severity": "high|medium|low",
+    "issue": "short description",
+    "fix": "suggested fix"
+  }}
+]
+
+Code:
+{code}
+"""
+                    }
                 ],
-                "temperature": 0.2
+                "temperature": 0.2,
+                "max_tokens": 512
             },
-            timeout=15
+            timeout=20
         )
 
-        content = res.json()["choices"][0]["message"]["content"]
+        data = response.json()
 
-        return eval(content) if content.startswith("[") else []
+        content = data["choices"][0]["message"]["content"]
 
-    except Exception:
+        # safer parsing
+        import json as pyjson
+        return pyjson.loads(content) if content.startswith("[") else []
+
+    except Exception as e:
+        print("LLM Error:", e)
         return []
 
 
