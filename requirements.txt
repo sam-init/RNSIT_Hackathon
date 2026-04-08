@@ -1,8 +1,4 @@
-
+fastapi
 httpx
 uvicorn
-requests
-fastapi
-
-
 
