@@ -1,64 +1,644 @@
-# main.py
-import os
-import hmac
+"""
+main.py — GitHub Webhook Receiver with Inline Review Comment Support
+=====================================================================
+
+Receives GitHub PR webhook events, verifies HMAC-SHA256 signatures,
+runs the ph AI review engine, and posts INLINE COMMENTS via the GitHub
+Pull Request Review API — not just PR-level comments.
+
+Environment variables:
+    GITHUB_TOKEN    — Fine-grained PAT: pull_requests:write + contents:read
+    WEBHOOK_SECRET  — Matches the secret in GitHub → Settings → Webhooks
+
+Run locally:
+    uvicorn main:app --reload --port 8000
+
+Production (Render, Railway, Fly.io):
+    uvicorn main:app --host 0.0.0.0 --port $PORT --workers 2
+"""
+
+from __future__ import annotations
+
 import hashlib
+import hmac
+import json
 import logging
-from fastapi import FastAPI, Request, Header, HTTPException
+import os
+import sys
+import traceback
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
-from processor import process_pr_event
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 
-# ─────────────────────────────────────────────
-# Setup
-# ─────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("main")
+# Import the review engine from ai_agent.py (same package)
+from ai_agent import (
+    DiffParser,
+    InlineComment,
+    MegaLLM,
+    SecurityScanner,
+)
 
-app = FastAPI()  # ✅ REQUIRED FOR UVICORN
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
 
-WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"].encode()
-executor = ThreadPoolExecutor(max_workers=4)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)-8s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("ph.webhook")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _require_env(name: str) -> str:
+    """
+    Read an env var and crash loudly at startup if it's missing.
+
+    Original bug: os.getenv("/etc/secrets/GITHUB_TOKEN") passes a FILE PATH
+    as the variable name — always returns None. Correct: os.environ.get("GITHUB_TOKEN").
+    """
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(
+            f"Required environment variable '{name}' is not set. "
+            "Set it in your deployment secrets (Render/Railway/Fly secret env)."
+        )
+    return value
 
 
-# ─────────────────────────────────────────────
-# Signature Verification
-# ─────────────────────────────────────────────
-def verify_signature(body: bytes, signature: str):
-    if not signature:
-        raise HTTPException(403, "Missing signature")
+GITHUB_TOKEN: str = _require_env("GITHUB_TOKEN")
+WEBHOOK_SECRET: bytes = _require_env("WEBHOOK_SECRET").encode("utf-8")
+
+# Externalise API base so tests can point at a mock (e.g. responses library)
+GITHUB_API_BASE: str = os.getenv("GITHUB_API_BASE", "https://api.github.com")
+
+# Concurrency: one thread per PR review job.
+# Switch to Celery/ARQ for production-scale workloads with retry persistence.
+MAX_WORKERS: int = int(os.getenv("PH_WEBHOOK_WORKERS", "4"))
+
+# Review behaviour flags
+ENABLE_INLINE_COMMENTS: bool = os.getenv("PH_INLINE_COMMENTS", "true").lower() == "true"
+ENABLE_SECURITY_SCAN: bool = os.getenv("PH_SECURITY_SCAN", "true").lower() == "true"
+# Maximum diff size to send to LLM (avoids blowing token budgets)
+MAX_DIFF_BYTES: int = int(os.getenv("PH_MAX_DIFF_BYTES", str(200_000)))  # 200 KB default
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data Models
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class PRContext:
+    """
+    Immutable value object for the essential fields of a PR webhook event.
+    Parsing this once at the top of the handler keeps process_pr() clean.
+
+    commits_url: used to fetch commit SHAs (needed for review commit_id)
+    diff_url:    the raw unified diff for this PR
+    head_sha:    the HEAD commit SHA — required by the GitHub Review API
+    """
+    repo: str           # "owner/repo"
+    pr_number: int
+    pr_title: str
+    pr_url: str
+    author: str
+    base_branch: str
+    head_branch: str
+    head_sha: str       # HEAD commit SHA — required by GitHub Review API
+    diff_url: str
+    commits_url: str
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any]) -> "PRContext":
+        """
+        Extract a PRContext from a raw GitHub webhook payload.
+        Raises ValueError (not KeyError) so callers can produce a 422 response.
+        """
+        try:
+            pr = payload["pull_request"]
+            return cls(
+                repo=payload["repository"]["full_name"],
+                pr_number=pr["number"],
+                pr_title=pr["title"],
+                pr_url=pr["html_url"],
+                author=pr["user"]["login"],
+                base_branch=pr["base"]["ref"],
+                head_branch=pr["head"]["ref"],
+                head_sha=pr["head"]["sha"],   # ← needed for review API
+                diff_url=pr["diff_url"],
+                commits_url=pr["commits_url"],
+            )
+        except KeyError as exc:
+            raise ValueError(f"Malformed PR payload — missing key: {exc}") from exc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Security — HMAC Verification
+# ─────────────────────────────────────────────────────────────────────────────
+
+def verify_github_signature(payload_body: bytes, signature_header: Optional[str]) -> None:
+    """
+    Verify the X-Hub-Signature-256 header using constant-time HMAC comparison.
+
+    Security notes:
+    - Raw body bytes are verified BEFORE JSON parsing — ensures we sign exactly
+      what GitHub signed, not a re-serialised version.
+    - hmac.compare_digest() prevents timing side-channel attacks.
+    - Header is lowercased before comparison to handle case normalisation.
+
+    Raises HTTPException(403) on any verification failure.
+    """
+    if not signature_header:
+        logger.warning("Rejected: missing X-Hub-Signature-256")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing signature header")
+
+    # Format: "sha256=<hex>"
+    parts = signature_header.split("=", maxsplit=1)
+    if len(parts) != 2 or parts[0] != "sha256":
+        logger.warning("Rejected: malformed signature header")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Malformed signature header")
+
+    expected = hmac.new(WEBHOOK_SECRET, msg=payload_body, digestmod=hashlib.sha256).hexdigest()
+
+    # Both operands must be the same type (str) for compare_digest
+    if not hmac.compare_digest(expected, parts[1].lower()):
+        logger.warning("Rejected: signature mismatch")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Signature mismatch")
+
+    logger.debug("Signature verified ✓")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GitHub API Client
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GitHubClient:
+    """
+    Thin wrapper around the GitHub REST API v3.
+
+    Uses httpx.Client (synchronous) because all calls happen inside
+    ThreadPoolExecutor worker threads — not in the async event loop.
+
+    Connection pooling: a single httpx.Client reuses TCP connections across
+    requests, avoiding the overhead of a new TLS handshake per call.
+
+    Key methods:
+      - post_pr_review()  → creates a GitHub Pull Request Review with inline comments
+      - post_comment()    → posts a PR-level (non-inline) issue comment
+      - get_diff()        → fetches the raw unified diff for a PR
+    """
+
+    def __init__(self, token: str, base_url: str = GITHUB_API_BASE) -> None:
+        self._base = base_url.rstrip("/")
+        # Build a session with all auth headers set once — reused for every request
+        self._client = httpx.Client(
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",  # pin to stable API version
+                "User-Agent": "ph-webhook/2.0",
+            },
+            timeout=20.0,   # fail fast — don't block worker threads
+            follow_redirects=True,
+        )
+
+    def post_pr_review(
+        self,
+        repo: str,
+        pr_number: int,
+        commit_id: str,
+        comments: List[InlineComment],
+        body: str = "",
+        event: str = "COMMENT",
+    ) -> Dict[str, Any]:
+        """
+        Submit a Pull Request Review containing inline comments.
+
+        This uses the GitHub Pull Request Reviews API:
+        POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews
+
+        A Review groups multiple inline comments into a single atomic review submission.
+        This is preferred over posting individual comments because:
+          - It shows as a single review in the PR timeline (less noise)
+          - All comments are associated with the same commit SHA
+          - Reviewers can approve/request-changes via event parameter
+
+        Args:
+            repo:       "owner/repo"
+            pr_number:  Pull request number
+            commit_id:  HEAD commit SHA of the PR (from PRContext.head_sha)
+            comments:   List of InlineComment objects to post as inline review comments
+            body:       Optional review summary shown at the top of the review
+            event:      "COMMENT" | "APPROVE" | "REQUEST_CHANGES"
+
+        Returns:
+            The created review object from the GitHub API.
+
+        Raises:
+            httpx.HTTPStatusError on API errors.
+        """
+        url = f"{self._base}/repos/{repo}/pulls/{pr_number}/reviews"
+
+        # Convert InlineComment objects to GitHub's review comment payload shape
+        github_comments = [c.to_github_payload() for c in comments]
+
+        payload: Dict[str, Any] = {
+            "commit_id": commit_id,
+            "body": body,
+            "event": event,
+            "comments": github_comments,
+        }
+
+        response = self._client.post(url, json=payload)
+
+        # Log the response for debugging — GitHub Review API errors can be subtle
+        if response.status_code not in (200, 201):
+            logger.error(
+                "GitHub Review API error: HTTP %d — %s",
+                response.status_code, response.text[:500]
+            )
+        response.raise_for_status()
+
+        review_id = response.json().get("id")
+        logger.info(
+            "PR review posted: repo=%s pr=%d review_id=%s comments=%d",
+            repo, pr_number, review_id, len(comments),
+        )
+        return response.json()
+
+    def post_comment(self, repo: str, issue_number: int, body: str) -> Dict[str, Any]:
+        """
+        Post a PR-level comment (not inline — visible at the bottom of the PR).
+        Used for summary comments (e.g., overall health score, security report).
+        """
+        url = f"{self._base}/repos/{repo}/issues/{issue_number}/comments"
+        response = self._client.post(url, json={"body": body})
+        response.raise_for_status()
+        logger.info("Comment posted on %s#%d", repo, issue_number)
+        return response.json()
+
+    def get_diff(self, diff_url: str) -> str:
+        """
+        Fetch the raw unified diff for a PR.
+        GitHub serves the diff with Accept: application/vnd.github.diff.
+        """
+        response = self._client.get(
+            diff_url,
+            headers={"Accept": "application/vnd.github.diff"},
+        )
+        response.raise_for_status()
+        return response.text
+
+    def close(self) -> None:
+        """Release connection pool — call on server shutdown."""
+        self._client.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR Review Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_pr(ctx: PRContext, github: GitHubClient, llm: MegaLLM) -> None:
+    """
+    Full AI review pipeline for a newly opened PR.
+
+    Steps:
+      1. Post acknowledgement comment (instant feedback to author)
+      2. Fetch the raw diff from GitHub
+      3. Run pattern-based security scanner (fast, no LLM needed)
+      4. Run LLM-based inline review (per-file, structured JSON output)
+      5. Post inline comments via GitHub PR Review API
+      6. Post a summary comment with overall findings
+
+    This runs in a ThreadPoolExecutor worker thread.  Any exception is caught
+    and logged — we never let one PR crash the worker pool.
+
+    Args:
+        ctx:    Immutable PR context (repo, number, head SHA, diff URL, …)
+        github: Shared GitHubClient with connection pooling
+        llm:    MegaLLM instance (one per worker thread — not shared across threads
+                because conversation_history is instance-level state)
+    """
+    logger.info("▶ Processing PR %s#%d: '%s'", ctx.repo, ctx.pr_number, ctx.pr_title)
 
     try:
-        sha_name, sig = signature.split("=")
+        # ── Step 1: Acknowledge immediately ────────────────────────────────────
+        # GitHub expects a webhook response within 10s; we return fast and do
+        # the heavy work here in a background thread.  The acknowledgement lets
+        # the author know their PR is being reviewed without waiting.
+        ack = (
+            f"## 🤖 ph AI Review\n\n"
+            f"Review started for **{ctx.pr_title}** by @{ctx.author}.\n"
+            f"> `{ctx.head_branch}` → `{ctx.base_branch}` | commit `{ctx.head_sha[:8]}`\n\n"
+            f"⏳ Analysing diff — inline comments will appear shortly…"
+        )
+        github.post_comment(ctx.repo, ctx.pr_number, ack)
+
+        # ── Step 2: Fetch diff ─────────────────────────────────────────────────
+        logger.info("Fetching diff: %s", ctx.diff_url)
+        diff_text = github.get_diff(ctx.diff_url)
+
+        if not diff_text.strip():
+            github.post_comment(ctx.repo, ctx.pr_number, "ℹ️ **ph**: Diff is empty — nothing to review.")
+            return
+
+        # Truncate very large diffs to avoid blowing LLM token limits.
+        # We truncate at a character boundary, not mid-hunk, so the parser
+        # still produces valid hunks from the truncated portion.
+        was_truncated = False
+        if len(diff_text.encode("utf-8")) > MAX_DIFF_BYTES:
+            diff_text = diff_text.encode("utf-8")[:MAX_DIFF_BYTES].decode("utf-8", errors="ignore")
+            was_truncated = True
+            logger.warning("Diff truncated to %d bytes for PR %s#%d", MAX_DIFF_BYTES, ctx.repo, ctx.pr_number)
+
+        # ── Step 3: Parse diff ─────────────────────────────────────────────────
+        parsed = DiffParser.parse(diff_text)
+        logger.info(
+            "Parsed diff: %d files, %d hunks", len(parsed.files), len(parsed.hunks)
+        )
+
+        # ── Step 4: Pattern-based security pre-scan ────────────────────────────
+        # This is fast (pure regex, no network) and catches obvious issues
+        # (hardcoded secrets, SQL injection, shell=True, etc.) before the LLM
+        # even starts.  Results are merged with AI findings in review_inline().
+        security_comments: List[InlineComment] = []
+        if ENABLE_SECURITY_SCAN:
+            security_comments = SecurityScanner.scan_diff(parsed)
+            logger.info("Pattern scan: %d security hits", len(security_comments))
+
+        # ── Step 5: LLM inline review ──────────────────────────────────────────
+        inline_comments: List[InlineComment] = []
+        if ENABLE_INLINE_COMMENTS:
+            # review_inline() processes file by file and returns deduplicated
+            # InlineComment objects that include the pattern-scan results.
+            inline_comments = llm.review_inline(
+                parsed, existing_security_comments=security_comments
+            )
+            logger.info("AI review: %d inline comments total", len(inline_comments))
+        else:
+            # If inline mode is disabled, still include security comments
+            inline_comments = security_comments
+
+        # ── Step 6: Post inline comments via GitHub Review API ─────────────────
+        if inline_comments:
+            # Build a summary body for the review header
+            critical_count = sum(1 for c in inline_comments if c.severity == "critical")
+            high_count = sum(1 for c in inline_comments if c.severity == "high")
+            medium_count = sum(1 for c in inline_comments if c.severity == "medium")
+
+            review_body = _build_review_summary(
+                ctx=ctx,
+                total=len(inline_comments),
+                critical=critical_count,
+                high=high_count,
+                medium=medium_count,
+                was_truncated=was_truncated,
+            )
+
+            # Split into batches of 50 — GitHub Review API has a per-review comment limit
+            for batch in _batch(inline_comments, size=50):
+                github.post_pr_review(
+                    repo=ctx.repo,
+                    pr_number=ctx.pr_number,
+                    commit_id=ctx.head_sha,
+                    comments=batch,
+                    body=review_body if batch is inline_comments[:50] else "",
+                    event="COMMENT",  # Don't auto-block PRs — let humans decide
+                )
+            logger.info("✅ Review complete for PR %s#%d", ctx.repo, ctx.pr_number)
+
+        else:
+            # No findings — post a passing review
+            github.post_pr_review(
+                repo=ctx.repo,
+                pr_number=ctx.pr_number,
+                commit_id=ctx.head_sha,
+                comments=[],
+                body="✅ **ph AI Review**: No issues found. Looks good! 🎉",
+                event="COMMENT",
+            )
+            logger.info("✅ Clean review for PR %s#%d", ctx.repo, ctx.pr_number)
+
+    except httpx.HTTPStatusError as exc:
+        # GitHub API rejected our request — log details, don't crash the worker
+        logger.error(
+            "GitHub API error for PR %s#%d: HTTP %d — %s",
+            ctx.repo, ctx.pr_number,
+            exc.response.status_code, exc.response.text[:300],
+        )
     except Exception:
-        raise HTTPException(403, "Invalid signature format")
+        # Catch-all: one bad PR must not kill the ThreadPoolExecutor worker
+        logger.error(
+            "Unhandled error processing PR %s#%d:\n%s",
+            ctx.repo, ctx.pr_number, traceback.format_exc(),
+        )
 
-    mac = hmac.new(WEBHOOK_SECRET, msg=body, digestmod=hashlib.sha256)
 
-    if not hmac.compare_digest(mac.hexdigest(), sig):
-        raise HTTPException(403, "Invalid signature")
+def _build_review_summary(
+    ctx: PRContext,
+    total: int,
+    critical: int,
+    high: int,
+    medium: int,
+    was_truncated: bool,
+) -> str:
+    """
+    Build the top-level Markdown body for the GitHub PR Review.
+    This appears as the review summary above the inline comments.
+    """
+    lines = [
+        f"## 🤖 ph AI Review — {ctx.pr_title}",
+        "",
+        f"| Severity | Count |",
+        f"|----------|-------|",
+        f"| 🚨 Critical | {critical} |",
+        f"| 🔴 High     | {high} |",
+        f"| 🟡 Medium   | {medium} |",
+        f"| **Total**   | **{total}** |",
+        "",
+    ]
+    if was_truncated:
+        lines.append(
+            "> ⚠️ **Note:** Diff was truncated due to size — only the first portion was reviewed."
+        )
+    lines += [
+        "",
+        "_Inline comments below. Apply suggestions with one click where available._",
+        "",
+        "---",
+        "_Powered by [ph](https://github.com/your-org/ph)_",
+    ]
+    return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────
-# Webhook Endpoint
-# ─────────────────────────────────────────────
-@app.post("/webhook")
+def _batch(items: List[Any], size: int) -> List[List[Any]]:
+    """Split a list into chunks of at most `size` elements."""
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Application Lifecycle
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Module-level shared resources — initialised in lifespan, cleaned up on shutdown.
+# ThreadPoolExecutor and GitHubClient are both thread-safe for concurrent reads.
+_executor: Optional[ThreadPoolExecutor] = None
+_github_client: Optional[GitHubClient] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI lifespan manager (replaces deprecated @app.on_event).
+    Everything before `yield` runs at startup; everything after at shutdown.
+    """
+    global _executor, _github_client
+
+    logger.info("🚀 Starting ph webhook server…")
+    _executor = ThreadPoolExecutor(
+        max_workers=MAX_WORKERS,
+        thread_name_prefix="pr-review",  # visible in thread dumps / profilers
+    )
+    _github_client = GitHubClient(token=GITHUB_TOKEN)
+    logger.info(
+        "Ready | workers=%d | inline=%s | security_scan=%s | api=%s",
+        MAX_WORKERS, ENABLE_INLINE_COMMENTS, ENABLE_SECURITY_SCAN, GITHUB_API_BASE,
+    )
+
+    yield  # ← server is running here
+
+    logger.info("🛑 Shutting down — draining in-flight PR jobs…")
+    if _executor:
+        _executor.shutdown(wait=True)   # wait for running reviews to finish
+    if _github_client:
+        _github_client.close()
+    logger.info("Shutdown complete.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FastAPI Application
+# ─────────────────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="ph Webhook",
+    description="GitHub PR webhook receiver with AI-powered inline code review",
+    version="2.0.0",
+    lifespan=lifespan,
+    # Uncomment in production to remove API docs (reduce attack surface):
+    # docs_url=None, redoc_url=None,
+)
+
+
+@app.get("/health", tags=["ops"])
+async def health_check() -> Dict[str, str]:
+    """
+    Liveness probe — used by Render, Railway, Fly.io, and Kubernetes.
+    Returns minimal info: no secrets, no internal state.
+    """
+    return {"status": "ok", "service": "ph-webhook", "version": "2.0.0"}
+
+
+@app.post("/webhook", tags=["webhook"])
 async def webhook(
     request: Request,
-    x_hub_signature_256: str = Header(None),
-):
-    logger.info("📩 Webhook received")
+    # FastAPI parses hyphenated header names to snake_case automatically
+    x_hub_signature_256: Optional[str] = Header(default=None),
+    x_github_event: Optional[str] = Header(default=None),
+    x_github_delivery: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Receive GitHub webhook events and dispatch background review jobs.
 
-    body = await request.body()
+    Flow:
+      1. Read raw body bytes (BEFORE JSON parsing — needed for HMAC)
+      2. Verify X-Hub-Signature-256
+      3. Parse JSON
+      4. Route: pull_request/opened → dispatch review job
+                ping              → acknowledge
+                anything else     → ignore
+      5. Return 200 immediately (GitHub times out at 10s)
 
-    verify_signature(body, x_hub_signature_256)
+    IMPORTANT: Never perform blocking work (HTTP calls, LLM inference) inside
+    this handler.  Always dispatch to the ThreadPoolExecutor.
+    """
+    logger.info(
+        "Webhook | event=%s | delivery=%s",
+        x_github_event or "?", x_github_delivery or "?",
+    )
 
-    payload = await request.json()
-    action = payload.get("action")
+    # ── Step 1: Read raw bytes ─────────────────────────────────────────────────
+    # Must happen before request.json() — we need the exact bytes GitHub signed.
+    # FastAPI caches the body internally so subsequent .json() calls still work.
+    raw_body: bytes = await request.body()
 
-    logger.info(f"Action: {action}")
+    # ── Step 2: Verify HMAC signature ─────────────────────────────────────────
+    verify_github_signature(raw_body, x_hub_signature_256)
 
-    if action in ["opened", "synchronize"]:
-        logger.info("Sending PR to processor")
-        executor.submit(process_pr_event, payload)
+    # ── Step 3: Parse JSON ─────────────────────────────────────────────────────
+    try:
+        payload: Dict[str, Any] = await request.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid JSON payload: {exc}",
+        ) from exc
 
-    return {"status": "ok"}
+    action: str = payload.get("action", "")
+    logger.info("Event: %s / action: %s", x_github_event, action)
+
+    # ── Step 4: Route ──────────────────────────────────────────────────────────
+
+    if x_github_event == "pull_request" and action in ("opened", "synchronize"):
+        # "synchronize" = new commits pushed to an existing PR — re-review
+        try:
+            ctx = PRContext.from_payload(payload)
+        except ValueError as exc:
+            logger.error("Malformed payload: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(exc),
+            ) from exc
+
+        if _executor and _github_client:
+            # Create a new MegaLLM instance per job — each review is independent.
+            # (Do NOT share a single llm instance across threads — conversation_history
+            #  is not thread-safe and would interleave across concurrent PR reviews.)
+            llm = MegaLLM()
+            _executor.submit(process_pr, ctx, _github_client, llm)
+            logger.info("PR %s#%d queued for review (action=%s)", ctx.repo, ctx.pr_number, action)
+        else:
+            # Should never happen if lifespan initialised correctly
+            logger.error("Executor or GitHub client not ready — dropping event")
+
+    elif x_github_event == "ping":
+        # GitHub sends a ping when a webhook is first configured
+        logger.info("GitHub ping ✓ (zen: %s)", payload.get("zen", "—"))
+
+    else:
+        logger.debug("Ignored event: %s/%s", x_github_event, action)
+
+    # Always return 200 — never let GitHub mark the delivery as failed
+    return JSONResponse(content={"status": "ok"}, status_code=status.HTTP_200_OK)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dev entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=True,       # hot-reload on file changes — dev only
+        log_level="info",
+    )
