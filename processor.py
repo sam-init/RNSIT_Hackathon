@@ -17,18 +17,20 @@ GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 # ─────────────────────────────────────────────
 # GitHub API
 # ─────────────────────────────────────────────
-def get_diff(diff_url):
-    logger.info(f"🌐 Fetching diff from: {diff_url}")
-    try:
-        headers = {"Accept": "application/vnd.github.diff"}
-        response = httpx.get(diff_url, headers=headers)
+diff = get_diff(f"https://api.github.com/repos/{repo}/pulls/{pr_number}")
+def get_diff(pr_api_url):
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3.diff",
+    }
 
-        logger.info(f"📡 Diff fetch status: {response.status_code}")
+    response = httpx.get(pr_api_url, headers=headers)
 
-        return response.text
-    except Exception as e:
-        logger.error(f"❌ Failed to fetch diff: {e}")
+    if response.status_code != 200:
+        print("❌ Failed to fetch diff:", response.text)
         return ""
+
+    return response.text
 
 
 def post_review(repo, pr_number, commit_id, comments):
