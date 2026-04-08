@@ -1,3 +1,9 @@
 fastapi
 uvicorn
 requests
+requests
+PyYAML
+fastapi
+uvicorn
+llama-cpp-python
+python-dotenv
