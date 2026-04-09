@@ -67,7 +67,11 @@ GITHUB_TOKEN: str = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_API_BASE: str = os.getenv("GITHUB_API_BASE", "https://api.github.com")
 
 # Gemini model — gemini-1.5-flash is fast and cheap; swap to gemini-1.5-pro for deeper analysis
-GEMINI_MODEL: str = os.getenv("STRUCTURE_GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODELS = [
+    os.getenv("STRUCTURE_GEMINI_MODEL", "gemini-1.5-flash"),
+    "gemini-1.5-pro",
+    "gemini-1.0-pro"
+]
 GEMINI_API_BASE: str = "https://generativelanguage.googleapis.com/v1beta"
 
 # Max files to include in the tree sent to Gemini (avoids token blowout on huge monorepos)
@@ -363,79 +367,50 @@ class GeminiClient:
                 "Get one at https://aistudio.google.com/app/apikey"
             )
         self.api_key = api_key
-        self.model = model
+        self.models = GEMINI_MODELS
         self.max_retries = max_retries
         self.timeout = timeout
         self._client = httpx.Client(timeout=timeout)
 
-    def generate(self, prompt: str, temperature: float = 0.1) -> str:
-        """
-        Send a prompt to Gemini and return the text response.
-        temperature=0.1 keeps output deterministic and precise (less creative hallucination).
-        """
-        url = f"{GEMINI_API_BASE}/models/{self.model}:generateContent?key={self.api_key}"
+def generate(self, prompt: str, temperature: float = 0.1) -> str:
+    last_error = None
+
+    for model in self.models:
+        url = f"{GEMINI_API_BASE}/models/{model}:generateContent?key={self.api_key}"
+
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": 4096,
-                "responseMimeType": "application/json",   # ask Gemini to return JSON directly
-            },
-            "systemInstruction": {
-                "parts": [{
-                    "text": (
-                        "You are a senior software architect specialising in project structure "
-                        "and code organisation. You review repository file trees and produce "
-                        "precise, actionable structural recommendations. "
-                        "You always return ONLY valid JSON — no preamble, no markdown fences, "
-                        "no explanations outside the JSON structure."
-                    )
-                }]
+                "responseMimeType": "application/json",
             },
         }
 
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                resp = self._client.post(url, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
+        print(f"🤖 Trying model: {model}")
 
-                # Extract text from Gemini's nested response structure
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    raise ValueError("Gemini returned no candidates")
+        try:
+            resp = self._client.post(url, json=payload)
+            resp.raise_for_status()
 
-                content = candidates[0].get("content", {})
-                parts = content.get("parts", [])
-                if not parts:
-                    raise ValueError("Gemini returned empty parts")
+            data = resp.json()
 
-                return parts[0].get("text", "")
+            candidates = data.get("candidates", [])
+            if not candidates:
+                raise ValueError("No candidates")
 
-            except httpx.HTTPStatusError as exc:
-                last_exc = exc
-                logger.warning(
-                    "Gemini HTTP error (attempt %d/%d): %d — %s",
-                    attempt, self.max_retries,
-                    exc.response.status_code, exc.response.text[:200],
-                )
-                if 400 <= exc.response.status_code < 500 and exc.response.status_code != 429:
-                    break   # Don't retry on bad requests (wrong key, bad payload)
+            parts = candidates[0]["content"]["parts"]
+            return parts[0]["text"]
 
-            except Exception as exc:
-                last_exc = exc
-                logger.warning("Gemini call failed (attempt %d/%d): %s", attempt, self.max_retries, exc)
+        except Exception as e:
+            print(f"❌ Model failed: {model} → {str(e)}")
+            last_error = e
+            continue
 
-            if attempt < self.max_retries:
-                sleep_for = 2 ** (attempt - 1)
-                logger.info("Retrying Gemini in %ds…", sleep_for)
-                time.sleep(sleep_for)
+    raise RuntimeError(f"All Gemini models failed: {last_error}")
 
-        raise RuntimeError(f"Gemini unavailable after {self.max_retries} attempts: {last_exc}")
-
-    def close(self) -> None:
-        self._client.close()
+def close(self) -> None:
+    self._client.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
