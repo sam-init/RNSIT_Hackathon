@@ -653,7 +653,7 @@ class StructureAgent:
 
         # Step 4: Build prompt and call Gemini
         prompt = PromptBuilder.build(tree, project_type, recommended_arch, pr_files)
-        logger.info("Sending tree to Gemini (%s)…", self.gemini.model)
+        logger.info("Sending tree to Gemini (%s)…", self.gemini.models[0])
 
         raw_response = self.gemini.generate(prompt)
         logger.debug("Gemini raw response: %r", raw_response[:500])
