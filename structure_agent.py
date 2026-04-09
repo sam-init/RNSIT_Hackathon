@@ -67,7 +67,7 @@ GITHUB_TOKEN: str = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_API_BASE: str = os.getenv("GITHUB_API_BASE", "https://api.github.com")
 
 # Gemini model — gemini-1.5-flash is fast and cheap; swap to gemini-1.5-pro for deeper analysis
-GEMINI_MODEL: str = os.getenv("STRUCTURE_GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL: str = os.getenv("STRUCTURE_GEMINI_MODEL", "gemini-1.5-flash")
 GEMINI_API_BASE: str = "https://generativelanguage.googleapis.com/v1beta"
 
 # Max files to include in the tree sent to Gemini (avoids token blowout on huge monorepos)
