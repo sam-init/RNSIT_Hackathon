@@ -302,20 +302,47 @@ class GitHubClient:
 
     def get_readme(self, repo: str) -> Optional[str]:
         """
-        Fetch the raw README content for *repo* via the GitHub Contents API.
-        Returns None if the README does not exist or the request fails — callers
-        should treat None as "README missing" rather than an error.
+        Fetch the raw README content for *repo* via the GitHub Readme API.
+
+        Uses GET /repos/{owner}/{repo}/readme instead of /contents/README.md
+        because the /readme endpoint:
+          - Auto-detects any README filename (README.md, readme.md, README.rst, …)
+          - Is case-insensitive on all platforms
+          - Returns the default-branch README without needing to specify a path
+
+        Handles two response formats from GitHub:
+          1. Raw text  → returned directly when Accept: vnd.github.raw is honoured
+          2. JSON blob → base64-encoded content field decoded as UTF-8 fallback
+
+        Returns None (treated as "README missing") on 404 or any error.
         """
-        url = f"{self._base}/repos/{repo}/contents/README.md"
+        url = f"{self._base}/repos/{repo}/readme"
         try:
             response = self._client.get(
                 url,
-                headers={"Accept": "application/vnd.github.raw+json"},
+                headers={"Accept": "application/vnd.github.raw"},  # raw bytes, not JSON
             )
             if response.status_code == 404:
-                return None          # no README — not an error
+                return None  # repo has no README — not an error
+
             response.raise_for_status()
-            return response.text
+
+            # GitHub occasionally ignores the Accept header and returns JSON with
+            # base64-encoded content (observed on some enterprise instances).
+            # Detect this and decode manually.
+            content_type = response.headers.get("content-type", "")
+            text = response.text.strip()
+            if "json" in content_type or text.startswith("{"):
+                try:
+                    import base64 as _base64
+                    data = response.json()
+                    raw_bytes = _base64.b64decode(data["content"])
+                    return raw_bytes.decode("utf-8", errors="replace")
+                except Exception:
+                    pass  # fall through to returning raw text as-is
+
+            return text
+
         except Exception as exc:
             logger.warning("README fetch failed for %s: %s", repo, exc)
             return None
