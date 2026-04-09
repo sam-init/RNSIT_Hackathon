@@ -468,6 +468,63 @@ def process_pr(ctx: PRContext, github: GitHubClient, llm: MegaLLM) -> None:
         except Exception:
             logger.warning("README consistency agent failed (non-fatal) for PR %s#%d", ctx.repo, ctx.pr_number)
 
+        # ── Step 5d: Safety Validation Layer ──────────────────────────────────
+        # GitHub Review API returns HTTP 422 "Line could not be resolved" when ANY
+        # comment references a file path or line number not present in the PR diff.
+        # A single invalid comment causes the ENTIRE review batch to be rejected.
+        # This block validates and fixes every comment BEFORE sending to GitHub.
+
+        # Build a map: file_path → set of valid new-file line numbers from the diff
+        valid_lines_per_file: Dict[str, set] = {}
+        for _hunk in parsed.hunks:
+            if _hunk.file_path not in valid_lines_per_file:
+                valid_lines_per_file[_hunk.file_path] = set()
+            for _ln, _ in _hunk.new_file_lines():
+                valid_lines_per_file[_hunk.file_path].add(_ln)
+
+        pr_files: set = set(valid_lines_per_file.keys())
+
+        _total_before = len(inline_comments)
+        _skipped = 0
+        validated_comments: List[InlineComment] = []
+
+        for _c in inline_comments:
+            # Guard 1: file must be in the PR diff
+            if _c.path not in pr_files:
+                logger.warning(
+                    "Validation: skipping comment — file not in PR diff: %s", _c.path
+                )
+                _skipped += 1
+                continue
+
+            _valid_lines = valid_lines_per_file[_c.path]
+
+            # Guard 2: file has no valid lines (edge case — empty hunk)
+            if not _valid_lines:
+                logger.warning(
+                    "Validation: skipping comment — no valid lines for file: %s", _c.path
+                )
+                _skipped += 1
+                continue
+
+            # Guard 3: line number must be in the diff; fix it to nearest valid line
+            if _c.line not in _valid_lines:
+                _old_line = _c.line
+                _c.line = min(_valid_lines)
+                logger.info(
+                    "Validation: fixed line %d → %d for %s", _old_line, _c.line, _c.path
+                )
+
+            validated_comments.append(_c)
+
+        _total_after = len(validated_comments)
+        logger.info(
+            "Safety validation: %d comments → %d after validation (%d skipped)",
+            _total_before, _total_after, _skipped,
+        )
+
+        inline_comments = validated_comments
+
         # ── Step 6: Post inline comments via GitHub Review API ─────────────────
         if inline_comments:
             critical_count = sum(1 for c in inline_comments if c.severity == "critical")
