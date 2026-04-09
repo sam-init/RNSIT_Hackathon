@@ -1,3 +1,23 @@
+# performance_agent.py — Performance Analysis Agent
+# ====================================================
+#
+# Detects performance issues in PR diffs:
+#   - unnecessary loops / O(n²) where O(n) is possible
+#   - repeated lookups in lists (should use set/dict)
+#   - redundant computations inside loops
+#   - blocking I/O in hot paths
+#   - memory-inefficient patterns
+#   - string concatenation in loops
+#   - sorting inside loops
+#
+# Integrates with the main.py pipeline via process_pr().
+# Uses the same NVIDIA LLM endpoint as ai_agent.py (MegaLLM).
+#
+# Usage:
+#   from performance_agent import PerformanceAgent, analyze_performance
+#   results = PerformanceAgent.analyze(diff, filename)
+#   results = analyze_performance(diff, filename)  # module-level alias
+
 import json
 import os
 import re
@@ -6,14 +26,33 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants — same defaults as codequality.py
+# ─────────────────────────────────────────────────────────────────────────────
+
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 DEFAULT_MODEL = "meta/llama-3.1-70b-instruct"
 MIN_CONFIDENCE = 0.7
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers — identical logic to codequality.py, kept local to avoid
+# cross-module coupling. DRY principle is intentionally relaxed here so
+# each agent file is self-contained and independently testable.
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _extract_file_diff(
     diff_text: str, filename: str
 ) -> Tuple[str, List[int], List[Tuple[int, str]]]:
+    """
+    Extract the diff section for *filename* from a full unified diff.
+
+    Returns:
+        (file_diff_text, added_line_numbers, added_lines)
+        - file_diff_text:      the raw diff lines for this file
+        - added_line_numbers:  sorted list of new-file line numbers that were added
+        - added_lines:         list of (line_no, code) pairs for each added line
+    """
     target_lines: List[str] = []
     added_line_numbers: List[int] = []
     added_lines: List[Tuple[int, str]] = []
@@ -36,7 +75,7 @@ def _extract_file_diff(
             continue
 
         if line.startswith("+++ b/"):
-            current_file = line[len("+++ b/") :]
+            current_file = line[len("+++ b/"):]
             in_target_file = current_file == filename
             if in_target_file:
                 target_lines.append(line)
@@ -76,6 +115,7 @@ def _extract_file_diff(
 
 
 def _clean_json_content(content: str) -> str:
+    """Strip accidental markdown code fences from LLM output."""
     text = content.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -84,6 +124,10 @@ def _clean_json_content(content: str) -> str:
 
 
 def _parse_model_json(content: str) -> List[Dict[str, Any]]:
+    """
+    Parse JSON from LLM response.  Falls back to bracket-extraction on
+    decode failure so a single stray character doesn't drop all findings.
+    """
     text = _clean_json_content(content)
 
     try:
@@ -94,7 +138,7 @@ def _parse_model_json(content: str) -> List[Dict[str, Any]]:
         if start == -1 or end == -1 or end < start:
             return []
         try:
-            data = json.loads(text[start : end + 1])
+            data = json.loads(text[start: end + 1])
         except json.JSONDecodeError:
             return []
 
@@ -113,6 +157,7 @@ def _line_is_valid(line: int, valid_line_set: Set[int]) -> bool:
 
 
 def _body_is_valid(body: str) -> bool:
+    """Enforce the structured body format so comments are consistent."""
     if not body.startswith("⚠️ "):
         return False
     if "\n\nExplanation:" not in body:
@@ -125,13 +170,21 @@ def _body_is_valid(body: str) -> bool:
 def _validate_and_normalize_results(
     raw_results: List[Dict[str, Any]], filename: str, valid_lines: List[int]
 ) -> List[Dict[str, Any]]:
+    """
+    Filter and normalise raw LLM output:
+    - Only keep items typed "performance"
+    - Enforce MIN_CONFIDENCE threshold
+    - Validate line numbers against the actual diff
+    - Deduplicate on (type, file, line, body)
+    """
     final_results: List[Dict[str, Any]] = []
-    seen = set()
+    seen: Set[tuple] = set()
     valid_line_set = set(valid_lines)
 
     for item in raw_results:
+        # This agent only accepts "performance" findings
         issue_type = item.get("type")
-        if issue_type not in {"quality", "performance"}:
+        if issue_type != "performance":
             continue
 
         body = item.get("body")
@@ -155,13 +208,12 @@ def _validate_and_normalize_results(
             continue
         if not _line_is_valid(raw_line, valid_line_set):
             continue
-        line = raw_line
 
         output = {
-            "agent": "code_quality",
+            "agent": "performance",
             "type": issue_type,
             "file": filename,
-            "line": line,
+            "line": raw_line,
             "body": body,
             "confidence": confidence,
         }
@@ -175,6 +227,10 @@ def _validate_and_normalize_results(
     return final_results
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt Builder
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _build_prompt(
     filename: str,
     commit_sha: Optional[str],
@@ -182,40 +238,53 @@ def _build_prompt(
     added_lines: List[Tuple[int, str]],
     valid_lines: List[int],
 ) -> List[Dict[str, str]]:
+    """
+    Build the system + user messages for the performance review LLM call.
+
+    System prompt focuses ONLY on performance — never security or quality.
+    User prompt lists added lines with their numbers so the model can anchor
+    findings to exact, verifiable line positions.
+    """
     line_catalog = "\n".join(
         f"{line_no}: {code[:200]}" for line_no, code in added_lines[:400]
     )
     valid_line_json = json.dumps(valid_lines)
 
     system_prompt = (
-        "You are a pull request review agent focused ONLY on code quality and performance. "
-        "Never report security issues. Never report architecture issues. "
+        "You are a pull request review agent focused ONLY on performance issues. "
+        "Never report security issues. Never report code quality or style issues. "
         "Return strictly valid JSON list and nothing else."
     )
 
     user_prompt = (
         f"Target file: {filename}\n"
         f"Commit SHA: {commit_sha or ''}\n\n"
-        "Analyze only:\n"
-        "- code quality issues (bad practices, duplication, naming, dead code)\n"
-        "- performance inefficiencies (loops, unnecessary operations, complexity)\n\n"
+        "Analyze ONLY performance issues such as:\n"
+        "- Unnecessary loops or O(n²) where O(n) is possible\n"
+        "- Repeated lookups in lists where a set or dict would be O(1)\n"
+        "- Redundant computations inside loops (precompute outside)\n"
+        "- Blocking I/O operations (synchronous DB calls, file reads in hot paths)\n"
+        "- Memory-inefficient patterns (building huge intermediate lists, no generators)\n"
+        "- Sorting inside loops\n"
+        "- String concatenation in loops (use join)\n\n"
         "Do not analyze:\n"
-        "- security issues\n"
-        "- architecture issues\n\n"
+        "- Security issues\n"
+        "- Code style or naming\n"
+        "- Architecture issues\n\n"
         "Rules:\n"
         "1. Use only these line numbers for comments: "
         f"{valid_line_json}\n"
-        "2. Return only high-confidence issues.\n"
+        "2. Return only high-confidence issues (confidence >= 0.7).\n"
         "3. Keep output minimal and actionable.\n"
         "4. Output must be a JSON list with objects using exactly these keys:\n"
         '   ["agent","type","file","line","body","confidence"]\n'
-        "5. agent must be \"code_quality\".\n"
-        "6. type must be \"quality\" or \"performance\".\n"
-        f"7. file must be exactly \"{filename}\".\n"
+        '5. agent must be "performance".\n'
+        '6. type must be "performance".\n'
+        f'7. file must be exactly "{filename}".\n'
         "8. body format must be exactly:\n"
         "   ⚠️ <issue title>\\n\\nExplanation: ...\\n\\nSuggestion: ...\n"
         "9. confidence must be a number from 0.0 to 1.0.\n"
-        "10. If no high-confidence issue, return [] exactly.\n\n"
+        "10. If no high-confidence performance issue exists, return [] exactly.\n\n"
         "Added lines (line: code):\n"
         f"{line_catalog}\n\n"
         "Unified diff for target file:\n"
@@ -228,14 +297,40 @@ def _build_prompt(
     ]
 
 
-class CodeQualityAgent:
+# ─────────────────────────────────────────────────────────────────────────────
+# PerformanceAgent
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PerformanceAgent:
+    """
+    LLM-powered performance analysis agent.
+
+    Takes the same inputs as CodeQualityAgent (raw diff text + filename)
+    and returns a list of structured findings in the same format.
+
+    Reuses the NVIDIA LLM endpoint configured via NVIDIA_API_KEY /
+    NVIDIA_MODEL environment variables — no new dependencies.
+    """
+
     @staticmethod
     def analyze(
         diff: str, filename: str, commit_sha: Optional[str] = None
     ) -> List[Dict[str, Any]]:
+        """
+        Run performance analysis on the added lines of *filename* in *diff*.
+
+        Args:
+            diff:       Raw unified diff text (full PR diff, not just one file).
+            filename:   Repo-relative file path to analyse (e.g. "src/utils.py").
+            commit_sha: Optional commit SHA for prompt context.
+
+        Returns:
+            List of normalised finding dicts, or [] on any failure.
+        """
         if not diff or not filename:
             return []
 
+        # Fail silently if API key is missing — don't crash the pipeline
         try:
             api_key = os.environ["NVIDIA_API_KEY"]
         except KeyError:
@@ -270,6 +365,7 @@ class CodeQualityAgent:
                 response.raise_for_status()
                 response_json = response.json()
         except Exception:
+            # Network / API error — return empty rather than crashing the pipeline
             return []
 
         content = (
@@ -287,10 +383,21 @@ class CodeQualityAgent:
     def scan(
         diff: str, filename: str, commit_sha: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        return CodeQualityAgent.analyze(diff=diff, filename=filename, commit_sha=commit_sha)
+        """Alias for analyze() — matches the .scan() interface on CodeQualityAgent."""
+        return PerformanceAgent.analyze(diff=diff, filename=filename, commit_sha=commit_sha)
 
 
-def analyze_code_quality(
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level function alias — matches analyze_code_quality() in codequality.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+def analyze_performance(
     diff: str, filename: str, commit_sha: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    return CodeQualityAgent.analyze(diff=diff, filename=filename, commit_sha=commit_sha)
+    """
+    Convenience wrapper — same signature as analyze_code_quality().
+
+    Returns a list of performance findings for *filename* in *diff*,
+    or [] if the agent fails or the API key is not set.
+    """
+    return PerformanceAgent.analyze(diff=diff, filename=filename, commit_sha=commit_sha)

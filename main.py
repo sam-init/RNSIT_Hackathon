@@ -379,6 +379,34 @@ def process_pr(ctx: PRContext, github: GitHubClient, llm: MegaLLM) -> None:
         else:
             inline_comments = security_comments
 
+        # ── Step 5a: Code Quality Agent ────────────────────────────────────────
+        try:
+            quality_comments = llm.analyze_code_quality(parsed)
+            logger.info("Code quality agent: %d findings", len(quality_comments))
+        except Exception:
+            quality_comments = []
+            logger.warning("Code quality agent failed (non-fatal) for PR %s#%d", ctx.repo, ctx.pr_number)
+
+        # ── Step 5b: Performance Agent ─────────────────────────────────────────
+        try:
+            perf_comments = llm.analyze_performance(parsed)
+            logger.info("Performance agent: %d findings", len(perf_comments))
+        except Exception:
+            perf_comments = []
+            logger.warning("Performance agent failed (non-fatal) for PR %s#%d", ctx.repo, ctx.pr_number)
+
+        # ── Merge: existing + quality + performance (deduplicate on path+line+category)
+        if quality_comments or perf_comments:
+            existing_keys = {(c.path, c.line, c.category) for c in inline_comments}
+            for c in quality_comments + perf_comments:
+                if (c.path, c.line, c.category) not in existing_keys:
+                    inline_comments.append(c)
+                    existing_keys.add((c.path, c.line, c.category))
+            logger.info(
+                "Merged total: %d inline comments for PR %s#%d",
+                len(inline_comments), ctx.repo, ctx.pr_number,
+            )
+
         # ── Step 6: Post inline comments via GitHub Review API ─────────────────
         if inline_comments:
             critical_count = sum(1 for c in inline_comments if c.severity == "critical")
