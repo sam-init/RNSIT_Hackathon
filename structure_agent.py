@@ -357,7 +357,7 @@ class GeminiClient:
     def __init__(
         self,
         api_key: str = GEMINI_API_KEY,
-        model: str = GEMINI_MODEL,
+        model: str = GEMINI_MODELS,
         max_retries: int = 3,
         timeout: float = 60.0,
     ) -> None:
