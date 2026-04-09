@@ -5,7 +5,4 @@ requests
 PyYAML
 fastapi
 uvicorn
-llama-cpp-python
-python-dotenv
-huggingface-hub
 httpx
