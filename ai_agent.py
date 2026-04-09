@@ -1355,6 +1355,128 @@ Rules:
         )
         return results
 
+    def analyze_readme_consistency(
+        self,
+        parsed_diff: "ParsedDiff",
+        readme_text: Optional[str],
+    ) -> List[InlineComment]:
+        """
+        README Consistency Agent — compares README expectations with code changes.
+
+        Two modes:
+          • README present  → ask LLM to spot clear mismatches between what the
+                              README describes and what the diff actually does.
+          • README missing  → return one low-severity suggestion on the first
+                              changed file, anchored to line 1.
+
+        Output is a List[InlineComment] (same type as all other agents) with
+        category="readme" so callers can filter / log by category.
+
+        Token budget is kept small:
+          - System prompt: 1 sentence
+          - README is capped at 3 000 chars
+          - Diff is capped at 2 000 chars
+          - Response capped at 512 tokens via the existing LLM_MAX_TOKENS setting
+        """
+        # ── Case 1: README missing ────────────────────────────────────────────
+        if not readme_text or not readme_text.strip():
+            anchor_file = parsed_diff.files[0] if parsed_diff.files else "README.md"
+            return [
+                InlineComment(
+                    path=anchor_file,
+                    line=1,
+                    body=(
+                        "**[LOW] readme** — README file is missing.\n\n"
+                        "> Add a README.md to describe project functionality, "
+                        "setup steps, and usage examples."
+                    ),
+                    severity="low",
+                    category="readme",
+                    side="RIGHT",
+                )
+            ]
+
+        # ── Case 2: README present — diff summary for the prompt ──────────────
+        # Build a compact diff summary (added lines only, capped at 2 000 chars)
+        added_lines_text = []
+        for hunk in parsed_diff.hunks:
+            for _ln, raw in hunk.new_file_lines():
+                if raw.startswith("+"):
+                    added_lines_text.append(f"{hunk.file_path}: {raw[1:].strip()}")
+        diff_summary = "\n".join(added_lines_text)[:2_000]
+
+        # Cap README to keep prompt token count bounded
+        readme_excerpt = readme_text.strip()[:3_000]
+
+        prompt = (
+            "Compare README expectations with code diff. "
+            "Report only clear, obvious mismatches (e.g. README says 'yellow background' "
+            "but code uses white; README lists a feature that is removed in the diff). "
+            "If unsure, return [].\n\n"
+            f"README (excerpt):\n{readme_excerpt}\n\n"
+            f"Diff (added lines):\n{diff_summary}\n\n"
+            "Return ONLY a JSON array. Each item must use exactly these keys:\n"
+            '{"file": "<path>", "line": <int>, "issue": "<one sentence>", '
+            '"suggestion": "<fix>", "severity": "low|medium", "category": "readme"}\n'
+            "Use line 1 if no specific line applies. Return [] if no clear mismatch."
+        )
+
+        try:
+            raw_response = self._call_api([{"role": "user", "content": prompt}])
+
+            # Robust JSON extraction — strip markdown fences if present
+            clean = re.sub(r'^```(?:json)?\s*', '', raw_response.strip())
+            clean = re.sub(r'\s*```$', '', clean).strip()
+
+            findings = json.loads(clean)
+            if not isinstance(findings, list):
+                return []
+
+        except Exception as exc:
+            logger.warning("README consistency agent failed: %s", exc)
+            return []
+
+        # Convert raw dicts → InlineComment objects
+        results: List[InlineComment] = []
+        valid_files = set(parsed_diff.files)
+
+        for f in findings:
+            file_path = str(f.get("file", "")).strip()
+            # Fall back to first PR file if the LLM returned an invalid path
+            if file_path not in valid_files:
+                file_path = parsed_diff.files[0] if parsed_diff.files else "README.md"
+
+            try:
+                line_no = max(1, int(f.get("line", 1)))
+            except (TypeError, ValueError):
+                line_no = 1
+
+            severity = str(f.get("severity", "low")).lower()
+            if severity not in ("low", "medium"):
+                severity = "low"
+
+            issue = str(f.get("issue", "")).strip()
+            suggestion = str(f.get("suggestion", "")).strip()
+            if not issue:
+                continue
+
+            body = (
+                f"**[{severity.upper()}] readme** — {issue}\n\n"
+                f"> {suggestion}"
+            )
+
+            results.append(InlineComment(
+                path=file_path,
+                line=line_no,
+                body=body,
+                severity=severity,
+                category="readme",
+                side="RIGHT",
+            ))
+
+        logger.info("analyze_readme_consistency: %d findings", len(results))
+        return results
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Score Utilities

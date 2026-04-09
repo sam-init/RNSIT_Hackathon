@@ -300,6 +300,26 @@ class GitHubClient:
         response.raise_for_status()
         return response.text
 
+    def get_readme(self, repo: str) -> Optional[str]:
+        """
+        Fetch the raw README content for *repo* via the GitHub Contents API.
+        Returns None if the README does not exist or the request fails — callers
+        should treat None as "README missing" rather than an error.
+        """
+        url = f"{self._base}/repos/{repo}/contents/README.md"
+        try:
+            response = self._client.get(
+                url,
+                headers={"Accept": "application/vnd.github.raw+json"},
+            )
+            if response.status_code == 404:
+                return None          # no README — not an error
+            response.raise_for_status()
+            return response.text
+        except Exception as exc:
+            logger.warning("README fetch failed for %s: %s", repo, exc)
+            return None
+
     def close(self) -> None:
         """Release connection pool — call on server shutdown."""
         self._client.close()
@@ -406,6 +426,20 @@ def process_pr(ctx: PRContext, github: GitHubClient, llm: MegaLLM) -> None:
                 "Merged total: %d inline comments for PR %s#%d",
                 len(inline_comments), ctx.repo, ctx.pr_number,
             )
+
+        # ── Step 5c: README Consistency Agent ─────────────────────────────────
+        try:
+            readme_text = github.get_readme(ctx.repo)
+            readme_comments = llm.analyze_readme_consistency(parsed, readme_text)
+            logger.info("README consistency agent: %d findings", len(readme_comments))
+            if readme_comments:
+                existing_keys = {(c.path, c.line, c.category) for c in inline_comments}
+                for c in readme_comments:
+                    if (c.path, c.line, c.category) not in existing_keys:
+                        inline_comments.append(c)
+                        existing_keys.add((c.path, c.line, c.category))
+        except Exception:
+            logger.warning("README consistency agent failed (non-fatal) for PR %s#%d", ctx.repo, ctx.pr_number)
 
         # ── Step 6: Post inline comments via GitHub Review API ─────────────────
         if inline_comments:
