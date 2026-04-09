@@ -43,6 +43,9 @@ from ai_agent import (
     SecurityScanner,
 )
 
+# Import the structure review agent
+from structure_agent import StructureAgent
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,7 +169,7 @@ def verify_github_signature(payload_body: bytes, signature_header: Optional[str]
         logger.warning("Rejected: malformed signature header")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Malformed signature header")
 
-    expected = hmac.new(WEBHOOK_SECRET, msg=payload_body, digestmod=hashlib.sha256).hexdigest()
+    expected = hmac.HMAC(WEBHOOK_SECRET, payload_body, hashlib.sha256).hexdigest()
 
     # Both operands must be the same type (str) for compare_digest
     if not hmac.compare_digest(expected, parts[1].lower()):
@@ -331,9 +334,6 @@ def process_pr(ctx: PRContext, github: GitHubClient, llm: MegaLLM) -> None:
 
     try:
         # ── Step 1: Acknowledge immediately ────────────────────────────────────
-        # GitHub expects a webhook response within 10s; we return fast and do
-        # the heavy work here in a background thread.  The acknowledgement lets
-        # the author know their PR is being reviewed without waiting.
         ack = (
             f"## 🤖 ph AI Review\n\n"
             f"Review started for **{ctx.pr_title}** by @{ctx.author}.\n"
@@ -351,8 +351,6 @@ def process_pr(ctx: PRContext, github: GitHubClient, llm: MegaLLM) -> None:
             return
 
         # Truncate very large diffs to avoid blowing LLM token limits.
-        # We truncate at a character boundary, not mid-hunk, so the parser
-        # still produces valid hunks from the truncated portion.
         was_truncated = False
         if len(diff_text.encode("utf-8")) > MAX_DIFF_BYTES:
             diff_text = diff_text.encode("utf-8")[:MAX_DIFF_BYTES].decode("utf-8", errors="ignore")
@@ -366,9 +364,6 @@ def process_pr(ctx: PRContext, github: GitHubClient, llm: MegaLLM) -> None:
         )
 
         # ── Step 4: Pattern-based security pre-scan ────────────────────────────
-        # This is fast (pure regex, no network) and catches obvious issues
-        # (hardcoded secrets, SQL injection, shell=True, etc.) before the LLM
-        # even starts.  Results are merged with AI findings in review_inline().
         security_comments: List[InlineComment] = []
         if ENABLE_SECURITY_SCAN:
             security_comments = SecurityScanner.scan_diff(parsed)
@@ -377,19 +372,15 @@ def process_pr(ctx: PRContext, github: GitHubClient, llm: MegaLLM) -> None:
         # ── Step 5: LLM inline review ──────────────────────────────────────────
         inline_comments: List[InlineComment] = []
         if ENABLE_INLINE_COMMENTS:
-            # review_inline() processes file by file and returns deduplicated
-            # InlineComment objects that include the pattern-scan results.
             inline_comments = llm.review_inline(
                 parsed, existing_security_comments=security_comments
             )
             logger.info("AI review: %d inline comments total", len(inline_comments))
         else:
-            # If inline mode is disabled, still include security comments
             inline_comments = security_comments
 
         # ── Step 6: Post inline comments via GitHub Review API ─────────────────
         if inline_comments:
-            # Build a summary body for the review header
             critical_count = sum(1 for c in inline_comments if c.severity == "critical")
             high_count = sum(1 for c in inline_comments if c.severity == "high")
             medium_count = sum(1 for c in inline_comments if c.severity == "medium")
@@ -404,19 +395,18 @@ def process_pr(ctx: PRContext, github: GitHubClient, llm: MegaLLM) -> None:
             )
 
             # Split into batches of 50 — GitHub Review API has a per-review comment limit
-            for batch in _batch(inline_comments, size=50):
+            for i, batch in enumerate(_batch(inline_comments, size=50)):
                 github.post_pr_review(
                     repo=ctx.repo,
                     pr_number=ctx.pr_number,
                     commit_id=ctx.head_sha,
                     comments=batch,
-                    body=review_body if batch is inline_comments[:50] else "",
-                    event="COMMENT",  # Don't auto-block PRs — let humans decide
+                    body=review_body if i == 0 else "",
+                    event="COMMENT",
                 )
             logger.info("✅ Review complete for PR %s#%d", ctx.repo, ctx.pr_number)
 
         else:
-            # No findings — post a passing review
             github.post_pr_review(
                 repo=ctx.repo,
                 pr_number=ctx.pr_number,
@@ -428,16 +418,37 @@ def process_pr(ctx: PRContext, github: GitHubClient, llm: MegaLLM) -> None:
             logger.info("✅ Clean review for PR %s#%d", ctx.repo, ctx.pr_number)
 
     except httpx.HTTPStatusError as exc:
-        # GitHub API rejected our request — log details, don't crash the worker
         logger.error(
             "GitHub API error for PR %s#%d: HTTP %d — %s",
             ctx.repo, ctx.pr_number,
             exc.response.status_code, exc.response.text[:300],
         )
     except Exception:
-        # Catch-all: one bad PR must not kill the ThreadPoolExecutor worker
         logger.error(
             "Unhandled error processing PR %s#%d:\n%s",
+            ctx.repo, ctx.pr_number, traceback.format_exc(),
+        )
+
+
+def run_structure_review(ctx: PRContext, agent: StructureAgent) -> None:
+    """
+    Run the Gemini-powered structure agent in a ThreadPoolExecutor worker thread.
+    Catches all exceptions so one bad PR cannot crash the worker pool.
+
+    Args:
+        ctx:   Immutable PR context (repo, number, head SHA)
+        agent: Shared StructureAgent instance (thread-safe for concurrent reads)
+    """
+    try:
+        logger.info("▶ Structure review starting: %s#%d", ctx.repo, ctx.pr_number)
+        issues = agent.review_pr(ctx.repo, ctx.pr_number, ctx.head_sha)
+        logger.info(
+            "✅ Structure review done: %s#%d — %d issues",
+            ctx.repo, ctx.pr_number, len(issues),
+        )
+    except Exception:
+        logger.error(
+            "Structure review failed for %s#%d:\n%s",
             ctx.repo, ctx.pr_number, traceback.format_exc(),
         )
 
@@ -489,9 +500,9 @@ def _batch(items: List[Any], size: int) -> List[List[Any]]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Module-level shared resources — initialised in lifespan, cleaned up on shutdown.
-# ThreadPoolExecutor and GitHubClient are both thread-safe for concurrent reads.
 _executor: Optional[ThreadPoolExecutor] = None
 _github_client: Optional[GitHubClient] = None
+_structure_agent: Optional[StructureAgent] = None
 
 
 @asynccontextmanager
@@ -500,14 +511,15 @@ async def lifespan(app: FastAPI):
     FastAPI lifespan manager (replaces deprecated @app.on_event).
     Everything before `yield` runs at startup; everything after at shutdown.
     """
-    global _executor, _github_client
+    global _executor, _github_client, _structure_agent
 
     logger.info("🚀 Starting ph webhook server…")
     _executor = ThreadPoolExecutor(
         max_workers=MAX_WORKERS,
-        thread_name_prefix="pr-review",  # visible in thread dumps / profilers
+        thread_name_prefix="pr-review",
     )
     _github_client = GitHubClient(token=GITHUB_TOKEN)
+    _structure_agent = StructureAgent()
     logger.info(
         "Ready | workers=%d | inline=%s | security_scan=%s | api=%s",
         MAX_WORKERS, ENABLE_INLINE_COMMENTS, ENABLE_SECURITY_SCAN, GITHUB_API_BASE,
@@ -517,9 +529,11 @@ async def lifespan(app: FastAPI):
 
     logger.info("🛑 Shutting down — draining in-flight PR jobs…")
     if _executor:
-        _executor.shutdown(wait=True)   # wait for running reviews to finish
+        _executor.shutdown(wait=True)
     if _github_client:
         _github_client.close()
+    if _structure_agent:
+        _structure_agent.close()
     logger.info("Shutdown complete.")
 
 
@@ -549,7 +563,6 @@ async def health_check() -> Dict[str, str]:
 @app.post("/webhook", tags=["webhook"])
 async def webhook(
     request: Request,
-    # FastAPI parses hyphenated header names to snake_case automatically
     x_hub_signature_256: Optional[str] = Header(default=None),
     x_github_event: Optional[str] = Header(default=None),
     x_github_delivery: Optional[str] = Header(default=None),
@@ -561,13 +574,13 @@ async def webhook(
       1. Read raw body bytes (BEFORE JSON parsing — needed for HMAC)
       2. Verify X-Hub-Signature-256
       3. Parse JSON
-      4. Route: pull_request/opened → dispatch review job
-                ping              → acknowledge
-                anything else     → ignore
+      4. Route: pull_request/opened|synchronize → dispatch both review agents
+                ping                            → acknowledge
+                anything else                   → ignore
       5. Return 200 immediately (GitHub times out at 10s)
 
     IMPORTANT: Never perform blocking work (HTTP calls, LLM inference) inside
-    this handler.  Always dispatch to the ThreadPoolExecutor.
+    this handler. Always dispatch to the ThreadPoolExecutor.
     """
     logger.info(
         "Webhook | event=%s | delivery=%s",
@@ -575,8 +588,6 @@ async def webhook(
     )
 
     # ── Step 1: Read raw bytes ─────────────────────────────────────────────────
-    # Must happen before request.json() — we need the exact bytes GitHub signed.
-    # FastAPI caches the body internally so subsequent .json() calls still work.
     raw_body: bytes = await request.body()
 
     # ── Step 2: Verify HMAC signature ─────────────────────────────────────────
@@ -596,8 +607,7 @@ async def webhook(
 
     # ── Step 4: Route ──────────────────────────────────────────────────────────
 
-    if x_github_event == "pull_request" and action in ("opened", "synchronize"):
-        # "synchronize" = new commits pushed to an existing PR — re-review
+    if x_github_event == "pull_request" and action in ("opened", "synchronize", "reopened"):
         try:
             ctx = PRContext.from_payload(payload)
         except ValueError as exc:
@@ -607,19 +617,23 @@ async def webhook(
                 detail=str(exc),
             ) from exc
 
-        if _executor and _github_client:
-            # Create a new MegaLLM instance per job — each review is independent.
-            # (Do NOT share a single llm instance across threads — conversation_history
-            #  is not thread-safe and would interleave across concurrent PR reviews.)
+        if _executor and _github_client and _structure_agent:
+            # Agent 1: Code quality + security review (ai_agent.py / MegaLLM)
+            # One MegaLLM instance per job — conversation_history is not thread-safe
             llm = MegaLLM()
             _executor.submit(process_pr, ctx, _github_client, llm)
-            logger.info("PR %s#%d queued for review (action=%s)", ctx.repo, ctx.pr_number, action)
+
+            # Agent 2: Repo structure review (structure_agent.py / Gemini)
+            _executor.submit(run_structure_review, ctx, _structure_agent)
+
+            logger.info(
+                "PR %s#%d queued for code + structure review (action=%s)",
+                ctx.repo, ctx.pr_number, action,
+            )
         else:
-            # Should never happen if lifespan initialised correctly
-            logger.error("Executor or GitHub client not ready — dropping event")
+            logger.error("Executor or clients not ready — dropping event")
 
     elif x_github_event == "ping":
-        # GitHub sends a ping when a webhook is first configured
         logger.info("GitHub ping ✓ (zen: %s)", payload.get("zen", "—"))
 
     else:
@@ -639,6 +653,6 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8000")),
-        reload=True,       # hot-reload on file changes — dev only
+        reload=True,
         log_level="info",
     )
