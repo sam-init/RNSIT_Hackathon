@@ -73,9 +73,17 @@ GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 GITHUB_TOKEN: str = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_API_BASE: str = os.getenv("GITHUB_API_BASE", "https://api.github.com")
 
-# Gemini model — gemini-1.5-flash is fast and cheap; swap to gemini-1.5-pro for deeper analysis
-GEMINI_MODEL: str = os.getenv("STRUCTURE_GEMINI_MODEL", "gemini-1.5-flash")
+# Gemini model defaults (from official docs stable model IDs)
+GEMINI_MODEL: str = os.getenv("STRUCTURE_GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_API_BASE: str = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_FALLBACK_MODELS: List[str] = [
+    m.strip()
+    for m in os.getenv(
+        "STRUCTURE_GEMINI_MODEL_FALLBACKS",
+        "gemini-2.5-flash-lite,gemini-2.5-pro",
+    ).split(",")
+    if m.strip()
+]
 
 # Max files to include in the tree sent to Gemini (avoids token blowout on huge monorepos)
 MAX_TREE_FILES: int = int(os.getenv("STRUCTURE_MAX_TREE_FILES", "300"))
@@ -371,6 +379,10 @@ class GeminiClient:
             )
         self.api_key = api_key
         self.model = model
+        self.model_candidates: List[str] = [self.model]
+        for candidate in GEMINI_FALLBACK_MODELS:
+            if candidate not in self.model_candidates:
+                self.model_candidates.append(candidate)
         self.max_retries = max_retries
         self.timeout = timeout
         self._client = httpx.Client(timeout=timeout)
@@ -389,7 +401,6 @@ class GeminiClient:
                 top_k=6,
             )
 
-        url = f"{GEMINI_API_BASE}/models/{self.model}:generateContent?key={self.api_key}"
         payload = {
             "contents": [{"parts": [{"text": grounded_prompt}]}],
             "generationConfig": {
@@ -412,44 +423,64 @@ class GeminiClient:
         }
 
         last_exc: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                resp = self._client.post(url, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
+        tried_models: List[str] = []
 
-                # Extract text from Gemini's nested response structure
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    raise ValueError("Gemini returned no candidates")
+        for model_name in self.model_candidates:
+            tried_models.append(model_name)
+            url = f"{GEMINI_API_BASE}/models/{model_name}:generateContent?key={self.api_key}"
 
-                content = candidates[0].get("content", {})
-                parts = content.get("parts", [])
-                if not parts:
-                    raise ValueError("Gemini returned empty parts")
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    resp = self._client.post(url, json=payload)
+                    resp.raise_for_status()
+                    data = resp.json()
 
-                return parts[0].get("text", "")
+                    # Extract text from Gemini's nested response structure
+                    candidates = data.get("candidates", [])
+                    if not candidates:
+                        raise ValueError("Gemini returned no candidates")
 
-            except httpx.HTTPStatusError as exc:
-                last_exc = exc
-                logger.warning(
-                    "Gemini HTTP error (attempt %d/%d): %d — %s",
-                    attempt, self.max_retries,
-                    exc.response.status_code, exc.response.text[:200],
-                )
-                if 400 <= exc.response.status_code < 500 and exc.response.status_code != 429:
-                    break   # Don't retry on bad requests (wrong key, bad payload)
+                    content = candidates[0].get("content", {})
+                    parts = content.get("parts", [])
+                    if not parts:
+                        raise ValueError("Gemini returned empty parts")
 
-            except Exception as exc:
-                last_exc = exc
-                logger.warning("Gemini call failed (attempt %d/%d): %s", attempt, self.max_retries, exc)
+                    if model_name != self.model:
+                        logger.info(
+                            "Gemini fallback model active: %s (requested: %s)",
+                            model_name, self.model,
+                        )
+                        self.model = model_name
+                    return parts[0].get("text", "")
 
-            if attempt < self.max_retries:
-                sleep_for = 2 ** (attempt - 1)
-                logger.info("Retrying Gemini in %ds…", sleep_for)
-                time.sleep(sleep_for)
+                except httpx.HTTPStatusError as exc:
+                    last_exc = exc
+                    status = exc.response.status_code
+                    logger.warning(
+                        "Gemini HTTP error model=%s (attempt %d/%d): %d — %s",
+                        model_name, attempt, self.max_retries, status, exc.response.text[:200],
+                    )
+                    if status == 404:
+                        # Model not found/unavailable for this key → try next model candidate.
+                        break
+                    if 400 <= status < 500 and status != 429:
+                        break   # Don't retry on non-rate-limit 4xx
 
-        raise RuntimeError(f"Gemini unavailable after {self.max_retries} attempts: {last_exc}")
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "Gemini call failed model=%s (attempt %d/%d): %s",
+                        model_name, attempt, self.max_retries, exc,
+                    )
+
+                if attempt < self.max_retries:
+                    sleep_for = 2 ** (attempt - 1)
+                    logger.info("Retrying Gemini in %ds…", sleep_for)
+                    time.sleep(sleep_for)
+
+        raise RuntimeError(
+            f"Gemini unavailable after trying models {tried_models}: {last_exc}"
+        )
 
     def close(self) -> None:
         self._client.close()
