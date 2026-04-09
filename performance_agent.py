@@ -24,6 +24,7 @@ import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
+from rag.grounding import augment_prompt_with_context, claim_has_support, retrieve_context
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -347,6 +348,13 @@ class PerformanceAgent:
             added_lines=added_lines,
             valid_lines=valid_lines,
         )
+        grounded_prompt, retrieved_chunks = augment_prompt_with_context(
+            messages[1]["content"],
+            query=f"{filename}\n{file_diff}",
+            file_hint=filename,
+            top_k=6,
+        )
+        messages[1]["content"] = grounded_prompt
 
         payload = {
             "model": os.getenv("NVIDIA_MODEL", DEFAULT_MODEL),
@@ -377,7 +385,19 @@ class PerformanceAgent:
             return []
 
         raw_results = _parse_model_json(content)
-        return _validate_and_normalize_results(raw_results, filename, valid_lines)
+        normalized_results = _validate_and_normalize_results(raw_results, filename, valid_lines)
+        if not normalized_results:
+            return []
+
+        if not retrieved_chunks:
+            retrieved_chunks = retrieve_context(f"{filename}\n{file_diff}", file_hint=filename, top_k=6)
+        evidence_texts = [file_diff, *[chunk.content for chunk in retrieved_chunks]]
+
+        grounded_results: List[Dict[str, Any]] = []
+        for item in normalized_results:
+            if claim_has_support(item.get("body", ""), evidence_texts):
+                grounded_results.append(item)
+        return grounded_results
 
     @staticmethod
     def scan(

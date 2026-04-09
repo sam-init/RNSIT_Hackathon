@@ -42,6 +42,13 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, TypeVa
 
 import requests
 import yaml
+from rag.grounding import (
+    RAG_ENABLED,
+    augment_prompt_with_context,
+    claim_has_support,
+    infer_file_hint,
+    retrieve_context,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration & Constants
@@ -800,6 +807,11 @@ class MegaLLM:
         "Prioritise security correctness above all else. "
         "When asked for JSON output, return ONLY valid JSON — no preamble, no backticks."
     )
+    GROUNDING_SYSTEM_RULES = (
+        "Use <retrieved_context> as your source of truth when present. "
+        "If evidence is insufficient, do not speculate. "
+        "For JSON-based review tasks, return [] when uncertain."
+    )
 
     def __init__(
         self,
@@ -827,9 +839,29 @@ class MegaLLM:
         POST to LLM endpoint with exponential back-off retry.
         System prompt is always prepended to ensure consistent behaviour.
         """
+        grounded_messages: List[Message] = [dict(m) for m in messages]
+        if RAG_ENABLED:
+            # Ground only the latest user turn to avoid bloating historical chat context.
+            for idx in range(len(grounded_messages) - 1, -1, -1):
+                if grounded_messages[idx].get("role") != "user":
+                    continue
+                user_prompt = grounded_messages[idx].get("content", "")
+                file_hint = infer_file_hint(user_prompt)
+                grounded_prompt, _ = augment_prompt_with_context(
+                    user_prompt,
+                    query=user_prompt,
+                    file_hint=file_hint,
+                )
+                grounded_messages[idx] = {"role": "user", "content": grounded_prompt}
+                break
+
+        system_prompt = self.system_prompt
+        if RAG_ENABLED:
+            system_prompt = f"{system_prompt}\n\n{self.GROUNDING_SYSTEM_RULES}"
+
         full_messages: List[Message] = [
-            {"role": "system", "content": self.system_prompt},
-            *messages,
+            {"role": "system", "content": system_prompt},
+            *grounded_messages,
         ]
         payload = {
             "model": self.model,
@@ -953,6 +985,10 @@ Focus on: bugs, security vulnerabilities, untested paths, complexity spikes, arc
                 )
                 diff_excerpt += "\n".join(hunk.lines)
 
+            valid_lines = {ln for h in file_hunks for ln, _ in h.new_file_lines()}
+            retrieved_chunks = retrieve_context(diff_excerpt, file_hint=file_path, top_k=6)
+            evidence_texts = [diff_excerpt, *[chunk.content for chunk in retrieved_chunks]]
+
             # Structured prompt — ask for JSON so we can parse it reliably
             prompt = f"""Analyse this diff excerpt and return ONLY a JSON array of findings.
 Each finding must conform to this schema:
@@ -990,13 +1026,22 @@ Rules:
 
             for f in findings:
                 # Validate line number is in the expected range for this file
-                line_no = int(f.get("line", 0))
-                if line_no <= 0:
+                try:
+                    line_no = int(f.get("line", 0))
+                except (TypeError, ValueError):
+                    continue
+                if line_no <= 0 or line_no not in valid_lines:
+                    continue
+
+                description = str(f.get("description", "")).strip()
+                suggestion = str(f.get("suggestion") or "").strip()
+                claim_text = f"{description}\n{suggestion}".strip()
+                if claim_text and not claim_has_support(claim_text, evidence_texts):
                     continue
 
                 body = (
                     f"**[{f.get('severity', 'medium').upper()}]** "
-                    f"_{f.get('category', 'bug')}_ — {f.get('description', '')}"
+                    f"_{f.get('category', 'bug')}_ — {description}"
                 )
 
                 all_comments.append(InlineComment(
@@ -1173,6 +1218,9 @@ Original code:
 
             # Build the line number catalog so the LLM anchors to real lines
             valid_lines = [ln for h in file_hunks for ln, _ in h.new_file_lines()]
+            valid_line_set = set(valid_lines)
+            retrieved_chunks = retrieve_context(diff_excerpt, file_hint=file_path, top_k=6)
+            evidence_texts = [diff_excerpt, *[chunk.content for chunk in retrieved_chunks]]
 
             prompt = f"""You are a code quality reviewer. Analyse this diff for code quality issues ONLY.
 Do NOT report security vulnerabilities — those are handled by a separate agent.
@@ -1219,12 +1267,18 @@ Rules:
                         line_no = int(f.get("line", 0))
                     except (TypeError, ValueError):
                         continue
-                    if line_no <= 0:
+                    if line_no <= 0 or line_no not in valid_line_set:
+                        continue
+
+                    description = str(f.get("description", "")).strip()
+                    suggestion = str(f.get("suggestion") or "").strip()
+                    claim_text = f"{description}\n{suggestion}".strip()
+                    if claim_text and not claim_has_support(claim_text, evidence_texts):
                         continue
 
                     body = (
                         f"**[{f.get('severity', 'medium').upper()}]** "
-                        f"_quality_ — {f.get('description', '')}"
+                        f"_quality_ — {description}"
                     )
                     results.append(InlineComment(
                         path=file_path,
@@ -1278,6 +1332,9 @@ Rules:
                 diff_excerpt += "\n".join(hunk.lines)
 
             valid_lines = [ln for h in file_hunks for ln, _ in h.new_file_lines()]
+            valid_line_set = set(valid_lines)
+            retrieved_chunks = retrieve_context(diff_excerpt, file_hint=file_path, top_k=6)
+            evidence_texts = [diff_excerpt, *[chunk.content for chunk in retrieved_chunks]]
 
             prompt = f"""You are a performance engineering reviewer. Analyse this diff for performance issues ONLY.
 Do NOT report security or style/naming issues — those are handled by separate agents.
@@ -1326,12 +1383,18 @@ Rules:
                         line_no = int(f.get("line", 0))
                     except (TypeError, ValueError):
                         continue
-                    if line_no <= 0:
+                    if line_no <= 0 or line_no not in valid_line_set:
+                        continue
+
+                    description = str(f.get("description", "")).strip()
+                    suggestion = str(f.get("suggestion") or "").strip()
+                    claim_text = f"{description}\n{suggestion}".strip()
+                    if claim_text and not claim_has_support(claim_text, evidence_texts):
                         continue
 
                     body = (
                         f"**[{f.get('severity', 'medium').upper()}]** "
-                        f"_performance_ — {f.get('description', '')}"
+                        f"_performance_ — {description}"
                     )
                     results.append(InlineComment(
                         path=file_path,
@@ -1407,6 +1470,12 @@ Rules:
 
         # Cap README to keep prompt token count bounded
         readme_excerpt = readme_text.strip()[:3_000]
+        retrieved_chunks = retrieve_context(
+            query=f"{readme_excerpt}\n{diff_summary}",
+            file_hint="README.md",
+            top_k=6,
+        )
+        evidence_texts = [readme_excerpt, diff_summary, *[chunk.content for chunk in retrieved_chunks]]
 
         prompt = (
             "Compare README expectations with code diff. "
@@ -1458,6 +1527,13 @@ Rules:
             issue = str(f.get("issue", "")).strip()
             suggestion = str(f.get("suggestion", "")).strip()
             if not issue:
+                continue
+            if not claim_has_support(
+                f"{issue}\n{suggestion}",
+                evidence_texts,
+                min_overlap_terms=1,
+                min_overlap_ratio=0.08,
+            ):
                 continue
 
             body = (

@@ -42,6 +42,7 @@ from ai_agent import (
     MegaLLM,
     SecurityScanner,
 )
+from rag.grounding import RAG_CONTEXT_CHARS, RAG_ENABLED, RAG_TOP_K
 
 # Import the structure review agent
 from structure_agent import StructureAgent
@@ -585,6 +586,12 @@ async def lifespan(app: FastAPI):
     logger.info(
         "Ready | workers=%d | inline=%s | security_scan=%s | api=%s",
         MAX_WORKERS, ENABLE_INLINE_COMMENTS, ENABLE_SECURITY_SCAN, GITHUB_API_BASE,
+    )
+    logger.info(
+        "RAG | enabled=%s | top_k=%d | context_chars=%d",
+        RAG_ENABLED,
+        RAG_TOP_K,
+        RAG_CONTEXT_CHARS,
     )
 
     yield  # ← server is running here

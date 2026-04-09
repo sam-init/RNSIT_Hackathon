@@ -39,12 +39,19 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+from rag.grounding import (
+    RAG_ENABLED,
+    augment_prompt_with_context,
+    claim_has_support,
+    retrieve_context,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -373,9 +380,18 @@ class GeminiClient:
         Send a prompt to Gemini and return the text response.
         temperature=0.1 keeps output deterministic and precise (less creative hallucination).
         """
+        grounded_prompt = prompt
+        if RAG_ENABLED:
+            grounded_prompt, _ = augment_prompt_with_context(
+                prompt,
+                query=prompt,
+                file_hint=None,
+                top_k=6,
+            )
+
         url = f"{GEMINI_API_BASE}/models/{self.model}:generateContent?key={self.api_key}"
         payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
+            "contents": [{"parts": [{"text": grounded_prompt}]}],
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": 4096,
@@ -388,7 +404,8 @@ class GeminiClient:
                         "and code organisation. You review repository file trees and produce "
                         "precise, actionable structural recommendations. "
                         "You always return ONLY valid JSON — no preamble, no markdown fences, "
-                        "no explanations outside the JSON structure."
+                        "no explanations outside the JSON structure. "
+                        "When retrieved context is provided, rely on it and do not speculate."
                     )
                 }]
             },
@@ -705,6 +722,8 @@ class StructureAgent:
         # (Gemini might hallucinate paths — anchor to real files)
         valid_issues = self._validate_paths(issues, tree, pr_files)
         logger.info("%d issues after path validation", len(valid_issues))
+        valid_issues = self._filter_grounded_issues(valid_issues, tree, pr_files)
+        logger.info("%d issues after grounding filter", len(valid_issues))
 
         # Step 7: Cap at MAX_COMMENTS, prioritise by severity
         severity_order = {"high": 0, "medium": 1, "low": 2}
@@ -813,6 +832,57 @@ class StructureAgent:
                 logger.debug("Dropping issue with unresolvable path: %s", issue.path)
 
         return validated
+
+    @staticmethod
+    def _extract_path_candidates(text: str) -> List[str]:
+        # Capture likely path-like tokens such as src/app.py, .env.example, pyproject.toml.
+        return re.findall(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", text)
+
+    def _is_plausible_missing_issue(self, issue: StructureIssue, file_set: set[str]) -> bool:
+        text = f"{issue.issue} {issue.suggestion}".lower()
+        if "missing" not in text:
+            return True
+        candidates = self._extract_path_candidates(f"{issue.issue} {issue.suggestion}")
+        if not candidates:
+            return True
+        # If Gemini claims "missing" but a named candidate file already exists, drop it.
+        for candidate in candidates:
+            if candidate in file_set:
+                return False
+        return True
+
+    def _filter_grounded_issues(
+        self,
+        issues: List[StructureIssue],
+        tree: RepoTree,
+        pr_files: List[str],
+    ) -> List[StructureIssue]:
+        if not issues:
+            return []
+
+        file_set = set(tree.files)
+        base_evidence = ["\n".join(tree.files), "\n".join(pr_files)]
+        filtered: List[StructureIssue] = []
+
+        for issue in issues:
+            claim = f"{issue.path}\n{issue.issue}\n{issue.suggestion}"
+            retrieved = retrieve_context(claim, file_hint=issue.path, top_k=4)
+            evidence = [*base_evidence, *[chunk.content for chunk in retrieved]]
+
+            if issue.category == "missing":
+                if self._is_plausible_missing_issue(issue, file_set):
+                    filtered.append(issue)
+                continue
+
+            if claim_has_support(
+                claim,
+                evidence,
+                min_overlap_terms=1,
+                min_overlap_ratio=0.08,
+            ):
+                filtered.append(issue)
+
+        return filtered
 
     @staticmethod
     def _build_summary(
