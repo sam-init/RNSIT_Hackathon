@@ -372,45 +372,44 @@ class GeminiClient:
         self.timeout = timeout
         self._client = httpx.Client(timeout=timeout)
 
-def generate(self, prompt: str, temperature: float = 0.1) -> str:
-    last_error = None
+    def generate(self, prompt: str, temperature: float = 0.1) -> str:
+        last_error = None
 
-    for model in self.models:
-        url = f"{GEMINI_API_BASE}/models/{model}:generateContent?key={self.api_key}"
+        for model in self.models:
+            url = f"{GEMINI_API_BASE}/models/{model}:generateContent?key={self.api_key}"
 
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": 4096,
-                "responseMimeType": "application/json",
-            },
-        }
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": temperature,
+                    "maxOutputTokens": 4096,
+                    "responseMimeType": "application/json",
+                },
+            }
 
-        print(f"🤖 Trying model: {model}")
+            logger.info("Trying Gemini model: %s", model)
 
-        try:
-            resp = self._client.post(url, json=payload)
-            resp.raise_for_status()
+            try:
+                resp = self._client.post(url, json=payload)
+                resp.raise_for_status()
 
-            data = resp.json()
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    raise ValueError("No candidates in Gemini response")
 
-            candidates = data.get("candidates", [])
-            if not candidates:
-                raise ValueError("No candidates")
+                parts = candidates[0]["content"]["parts"]
+                return parts[0]["text"]
 
-            parts = candidates[0]["content"]["parts"]
-            return parts[0]["text"]
+            except Exception as e:
+                logger.warning("Gemini model %s failed: %s", model, e)
+                last_error = e
+                continue
 
-        except Exception as e:
-            print(f"❌ Model failed: {model} → {str(e)}")
-            last_error = e
-            continue
+        raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
 
-    raise RuntimeError(f"All Gemini models failed: {last_error}")
-
-def close(self) -> None:
-    self._client.close()
+    def close(self) -> None:
+        self._client.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
