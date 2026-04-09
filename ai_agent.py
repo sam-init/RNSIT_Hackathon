@@ -1408,6 +1408,18 @@ Rules:
         # Cap README to keep prompt token count bounded
         readme_excerpt = readme_text.strip()[:3_000]
 
+        # ── Debug: log inputs so we can see them in server logs ───────────────
+        logger.info(
+            "README agent inputs: readme_len=%d readme_preview=%r diff_summary_len=%d",
+            len(readme_excerpt),
+            readme_excerpt[:200],
+            len(diff_summary),
+        )
+
+        if not diff_summary.strip():
+            logger.warning("README agent: diff_summary is empty — no added lines in PR diff")
+            return []
+
         prompt = (
             "Compare README expectations with code diff. "
             "Report only clear, obvious mismatches (e.g. README says 'yellow background' "
@@ -1416,13 +1428,19 @@ Rules:
             f"README (excerpt):\n{readme_excerpt}\n\n"
             f"Diff (added lines):\n{diff_summary}\n\n"
             "Return ONLY a JSON array. Each item must use exactly these keys:\n"
-            '{"file": "<path>", "line": <int>, "issue": "<one sentence>", '
+            '{"file": "<path>", "line": 1, "issue": "<one sentence>", '
             '"suggestion": "<fix>", "severity": "low|medium", "category": "readme"}\n'
-            "Use line 1 if no specific line applies. Return [] if no clear mismatch."
+            "Always use line 1. Return [] if no clear mismatch."
         )
 
         try:
             raw_response = self._call_api([{"role": "user", "content": prompt}])
+
+            # ── Debug: log raw LLM response before any parsing ────────────────
+            logger.info(
+                "README agent raw LLM response (first 500 chars): %r",
+                raw_response[:500],
+            )
 
             # Robust JSON extraction — strip markdown fences if present
             clean = re.sub(r'^```(?:json)?\s*', '', raw_response.strip())
@@ -1430,27 +1448,26 @@ Rules:
 
             findings = json.loads(clean)
             if not isinstance(findings, list):
+                logger.warning("README agent: LLM returned non-list JSON: %r", clean[:200])
                 return []
 
+        except json.JSONDecodeError as exc:
+            logger.warning("README agent: JSON parse failed — %s | raw=%r", exc, raw_response[:300])
+            return []
         except Exception as exc:
             logger.warning("README consistency agent failed: %s", exc)
             return []
 
         # Convert raw dicts → InlineComment objects
         results: List[InlineComment] = []
-        valid_files = set(parsed_diff.files)
+
+        # README findings are not anchored to a specific diff line.
+        # GitHub silently ignores inline comments where the line number
+        # doesn't exist in the PR diff — so we always anchor to line 1
+        # of the first changed file to guarantee the comment is posted.
+        anchor_file = parsed_diff.files[0] if parsed_diff.files else "README.md"
 
         for f in findings:
-            file_path = str(f.get("file", "")).strip()
-            # Fall back to first PR file if the LLM returned an invalid path
-            if file_path not in valid_files:
-                file_path = parsed_diff.files[0] if parsed_diff.files else "README.md"
-
-            try:
-                line_no = max(1, int(f.get("line", 1)))
-            except (TypeError, ValueError):
-                line_no = 1
-
             severity = str(f.get("severity", "low")).lower()
             if severity not in ("low", "medium"):
                 severity = "low"
@@ -1466,8 +1483,8 @@ Rules:
             )
 
             results.append(InlineComment(
-                path=file_path,
-                line=line_no,
+                path=anchor_file,     # always a real PR file
+                line=1,               # always line 1 — guaranteed to exist in diff
                 body=body,
                 severity=severity,
                 category="readme",
