@@ -1140,6 +1140,221 @@ Original code:
 
         return list(best.values())
 
+    # ── New agents — Code Quality & Performance ───────────────────────────────
+
+    def analyze_code_quality(self, parsed_diff: "ParsedDiff") -> List[InlineComment]:
+        """
+        Code Quality Agent — detects bad naming, poor readability, duplicated
+        logic, large functions, and bad practices.
+
+        Input/output contract is identical to review_inline():
+          - Takes a ParsedDiff (from DiffParser.parse())
+          - Returns List[InlineComment] ready for GitHubClient.post_pr_review()
+          - Returns [] on any failure (never raises — pipeline must stay alive)
+
+        Called from process_pr() in main.py after review_inline().
+        Results are merged with existing inline_comments before posting.
+        """
+        results: List[InlineComment] = []
+
+        for file_path in parsed_diff.files:
+            file_hunks = parsed_diff.hunks_for_file(file_path)
+            if not file_hunks:
+                continue
+
+            # Build the per-file diff excerpt (same pattern as review_inline)
+            diff_excerpt = f"File: {file_path}\n"
+            for hunk in file_hunks:
+                diff_excerpt += (
+                    f"\n@@ -{hunk.old_start},{hunk.old_count} "
+                    f"+{hunk.new_start},{hunk.new_count} @@ {hunk.context}\n"
+                )
+                diff_excerpt += "\n".join(hunk.lines)
+
+            # Build the line number catalog so the LLM anchors to real lines
+            valid_lines = [ln for h in file_hunks for ln, _ in h.new_file_lines()]
+
+            prompt = f"""You are a code quality reviewer. Analyse this diff for code quality issues ONLY.
+Do NOT report security vulnerabilities — those are handled by a separate agent.
+
+Detect:
+- Bad or unclear variable/function names (single letters, abbreviations like tmp, q, t)
+- Poor readability (deeply nested code, long functions > 50 lines)
+- Duplicated logic (same loop or block repeated)
+- Bad practices (mutable default args, bare except, print() in library code)
+- Dead code (unreachable lines after return, unused variables)
+
+Return ONLY a JSON array. Each item must use exactly these keys:
+{{
+  "line": <int — must be one of {valid_lines[:50]}>,
+  "severity": "high|medium|low",
+  "category": "quality",
+  "description": "<one sentence>",
+  "suggestion": "<concrete fix or null>"
+}}
+
+Rules:
+- Only report lines present in this diff.
+- Be conservative — skip low-confidence findings.
+- If no issues, return [].
+- Return ONLY the JSON array, no extra text.
+
+<diff_excerpt>
+{diff_excerpt}
+</diff_excerpt>"""
+
+            try:
+                raw_response = self._call_api([{"role": "user", "content": prompt}])
+
+                # Robust JSON extraction — strip accidental markdown fences
+                clean = re.sub(r'^```(?:json)?\s*', '', raw_response.strip())
+                clean = re.sub(r'\s*```$', '', clean).strip()
+
+                findings = json.loads(clean)
+                if not isinstance(findings, list):
+                    continue
+
+                for f in findings:
+                    try:
+                        line_no = int(f.get("line", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if line_no <= 0:
+                        continue
+
+                    body = (
+                        f"**[{f.get('severity', 'medium').upper()}]** "
+                        f"_quality_ — {f.get('description', '')}"
+                    )
+                    results.append(InlineComment(
+                        path=file_path,
+                        line=line_no,
+                        body=body,
+                        severity=f.get("severity", "medium"),
+                        category="quality",
+                        side="RIGHT",
+                        suggestion=f.get("suggestion"),
+                    ))
+
+            except Exception as exc:
+                logger.warning(
+                    "Code quality agent failed for %s: %s", file_path, exc
+                )
+                continue  # one file failing must not kill the rest
+
+        logger.info(
+            "analyze_code_quality: %d findings across %d files",
+            len(results), len(parsed_diff.files),
+        )
+        return results
+
+    def analyze_performance(self, parsed_diff: "ParsedDiff") -> List[InlineComment]:
+        """
+        Performance Agent — detects unnecessary loops, inefficient queries,
+        blocking operations, redundant computations, and memory inefficiency.
+
+        Input/output contract is identical to review_inline():
+          - Takes a ParsedDiff (from DiffParser.parse())
+          - Returns List[InlineComment] ready for GitHubClient.post_pr_review()
+          - Returns [] on any failure (never raises — pipeline must stay alive)
+
+        Called from process_pr() in main.py after review_inline().
+        Results are merged with existing inline_comments before posting.
+        """
+        results: List[InlineComment] = []
+
+        for file_path in parsed_diff.files:
+            file_hunks = parsed_diff.hunks_for_file(file_path)
+            if not file_hunks:
+                continue
+
+            # Build the per-file diff excerpt
+            diff_excerpt = f"File: {file_path}\n"
+            for hunk in file_hunks:
+                diff_excerpt += (
+                    f"\n@@ -{hunk.old_start},{hunk.old_count} "
+                    f"+{hunk.new_start},{hunk.new_count} @@ {hunk.context}\n"
+                )
+                diff_excerpt += "\n".join(hunk.lines)
+
+            valid_lines = [ln for h in file_hunks for ln, _ in h.new_file_lines()]
+
+            prompt = f"""You are a performance engineering reviewer. Analyse this diff for performance issues ONLY.
+Do NOT report security or style/naming issues — those are handled by separate agents.
+
+Detect:
+- Unnecessary loops or O(n²) complexity where O(n) is achievable
+- Repeated list lookups that should use a set or dict for O(1) access
+- Redundant computations inside loops (precompute outside)
+- Blocking I/O / synchronous DB calls in hot code paths
+- Memory-inefficient patterns (building large lists that could be generators)
+- String concatenation inside loops (use str.join())
+- Sorting inside loops (sort once outside)
+
+Return ONLY a JSON array. Each item must use exactly these keys:
+{{
+  "line": <int — must be one of {valid_lines[:50]}>,
+  "severity": "high|medium|low",
+  "category": "performance",
+  "description": "<one sentence>",
+  "suggestion": "<concrete fix or null>"
+}}
+
+Rules:
+- Only report lines present in this diff.
+- Be conservative — skip low-confidence findings.
+- If no issues, return [].
+- Return ONLY the JSON array, no extra text.
+
+<diff_excerpt>
+{diff_excerpt}
+</diff_excerpt>"""
+
+            try:
+                raw_response = self._call_api([{"role": "user", "content": prompt}])
+
+                # Robust JSON extraction
+                clean = re.sub(r'^```(?:json)?\s*', '', raw_response.strip())
+                clean = re.sub(r'\s*```$', '', clean).strip()
+
+                findings = json.loads(clean)
+                if not isinstance(findings, list):
+                    continue
+
+                for f in findings:
+                    try:
+                        line_no = int(f.get("line", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if line_no <= 0:
+                        continue
+
+                    body = (
+                        f"**[{f.get('severity', 'medium').upper()}]** "
+                        f"_performance_ — {f.get('description', '')}"
+                    )
+                    results.append(InlineComment(
+                        path=file_path,
+                        line=line_no,
+                        body=body,
+                        severity=f.get("severity", "medium"),
+                        category="performance",
+                        side="RIGHT",
+                        suggestion=f.get("suggestion"),
+                    ))
+
+            except Exception as exc:
+                logger.warning(
+                    "Performance agent failed for %s: %s", file_path, exc
+                )
+                continue
+
+        logger.info(
+            "analyze_performance: %d findings across %d files",
+            len(results), len(parsed_diff.files),
+        )
+        return results
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Score Utilities
