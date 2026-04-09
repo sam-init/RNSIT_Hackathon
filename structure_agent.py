@@ -62,9 +62,9 @@ logger = logging.getLogger("ph.structure")
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY: str = os.environ["GEMINI_API_KEY"]
-GITHUB_TOKEN: str = os.environ["GITHUB_TOKEN"]
-GITHUB_API_BASE: str = os.getenv["GITHUB_API_BASE", "https://api.github.com"]
+GEMINI_API_KEY: str = os.environ("GEMINI_API_KEY")
+GITHUB_TOKEN: str = os.environ("GITHUB_TOKEN")
+GITHUB_API_BASE: str = os.getenv("GITHUB_API_BASE", "https://api.github.com")
 
 # Gemini model — gemini-1.5-flash is fast and cheap; swap to gemini-1.5-pro for deeper analysis
 GEMINI_MODEL: str = os.getenv("STRUCTURE_GEMINI_MODEL", "gemini-1.5-flash")
