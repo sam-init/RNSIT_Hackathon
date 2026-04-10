@@ -1,8 +1,5 @@
 fastapi
-uvicorn
-requests
-requests
-PyYAML
-fastapi
-uvicorn
 httpx
+PyYAML
+requests
+uvicorn
