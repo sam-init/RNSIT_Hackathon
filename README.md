@@ -37,7 +37,7 @@ It combines:
 ## Architecture
 ```mermaid
 flowchart LR
-    A[GitHub Pull Request Event] --> B[/webhook FastAPI service]
+    A[GitHub Pull Request Event] --> B["/webhook FastAPI service"]
     B --> C[HMAC verification]
     C --> D[Diff fetch + parsing]
     D --> E[Security scan]
