@@ -1,5 +1,5 @@
 """
-structure_agent.py — Repo Architecture Review Agent (Gemini-powered)
+structure_agent.py — Repo Architecture Review Agent (MegaLLM-powered)
 =====================================================================
 
 A standalone AI agent that analyses a PR's repository structure and suggests
@@ -15,12 +15,12 @@ Core flow:
   1. Receive PR webhook (repo + PR number)
   2. Fetch the full file tree of the repo via GitHub Trees API
   3. Detect the project type (Python/FastAPI, Node/Express, etc.)
-  4. Ask Gemini to analyse the tree and produce structured recommendations
+  4. Ask the LLM to analyse the tree and produce structured recommendations
   5. Map each recommendation to a file path so GitHub can anchor it inline
   6. Post inline comments via the GitHub PR Review API
 
 Environment variables required:
-    GEMINI_API_KEY      — Google AI Studio key (https://aistudio.google.com/app/apikey)
+    LLM_API_KEY         — API key for the LLM endpoint (same as ai_agent.py)
     GITHUB_TOKEN        — Fine-grained PAT with pull_requests:write + contents:read
     WEBHOOK_SECRET      — Matches the secret in GitHub → Settings → Webhooks
 
@@ -46,6 +46,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+# Reuse the same LLM client used by all other agents
+from ai_agent import MegaLLM
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,15 +65,10 @@ logger = logging.getLogger("ph.structure")
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 GITHUB_TOKEN: str = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_API_BASE: str = os.getenv("GITHUB_API_BASE", "https://api.github.com")
 
-# Gemini model — gemini-1.5-flash is fast and cheap; swap to gemini-1.5-pro for deeper analysis
-GEMINI_MODEL: str = os.getenv("STRUCTURE_GEMINI_MODEL", "gemini-2.0-flash")
-GEMINI_API_BASE: str = "https://generativelanguage.googleapis.com/v1beta"
-
-# Max files to include in the tree sent to Gemini (avoids token blowout on huge monorepos)
+# Max files to include in the tree sent to the LLM (avoids token blowout on huge monorepos)
 MAX_TREE_FILES: int = int(os.getenv("STRUCTURE_MAX_TREE_FILES", "300"))
 
 # Max inline comments to post per PR (keep it low — don't spam the PR)
@@ -83,7 +81,7 @@ MAX_COMMENTS: int = int(os.getenv("STRUCTURE_MAX_COMMENTS", "15"))
 @dataclass
 class StructureIssue:
     """
-    A single structural finding produced by the Gemini agent.
+    A single structural finding produced by the structure agent.
 
     path:        The file or directory path the comment anchors to.
                  For file-level issues this is an exact path (e.g. "app/models.py").
@@ -121,7 +119,7 @@ class StructureIssue:
             f"{severity_emoji} **[STRUCTURE] {category_label}**\n\n"
             f"**Issue:** {self.issue}\n\n"
             f"**Recommended fix:** {self.suggestion}\n\n"
-            f"_— ph Structure Agent (Gemini)_"
+            f"_— ph Structure Agent_"
         )
         return {
             "path": self.path,
@@ -153,7 +151,7 @@ class RepoTree:
 
     @property
     def tree_text(self) -> str:
-        """Render the tree as indented text for the Gemini prompt."""
+        """Render the tree as indented text for the LLM prompt."""
         lines = []
         for path in sorted(self.files):
             depth = path.count("/")
@@ -175,7 +173,7 @@ class RepoTree:
 class ProjectDetector:
     """
     Heuristic-based project type detector.
-    Runs before the Gemini call so we can give it the right architecture template.
+    Runs before the LLM call so we can give it the right architecture template.
     """
 
     # Each entry: (label, required_files_or_dirs, optional_bonus_files)
@@ -338,105 +336,6 @@ General best practices for any project:
         return architectures.get(project_type, architectures["Unknown"])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Gemini Client
-# ─────────────────────────────────────────────────────────────────────────────
-
-class GeminiClient:
-    """
-    Minimal Gemini REST API client.
-    Uses the generateContent endpoint directly (no SDK dependency).
-
-    Endpoint: POST /v1beta/models/{model}:generateContent?key={api_key}
-    """
-
-    def __init__(
-        self,
-        api_key: str = GEMINI_API_KEY,
-        model: str = GEMINI_MODEL,
-        max_retries: int = 3,
-        timeout: float = 60.0,
-    ) -> None:
-        if not api_key:
-            raise RuntimeError(
-                "GEMINI_API_KEY is not set. "
-                "Get one at https://aistudio.google.com/app/apikey"
-            )
-        self.api_key = api_key
-        self.model = model
-        self.max_retries = max_retries
-        self.timeout = timeout
-        self._client = httpx.Client(timeout=timeout)
-
-    def generate(self, prompt: str, temperature: float = 0.1) -> str:
-        """
-        Send a prompt to Gemini and return the text response.
-        temperature=0.1 keeps output deterministic and precise (less creative hallucination).
-        """
-        url = f"{GEMINI_API_BASE}/models/{self.model}:generateContent?key={self.api_key}"
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": 4096,
-                "responseMimeType": "application/json",   # ask Gemini to return JSON directly
-            },
-            "systemInstruction": {
-                "parts": [{
-                    "text": (
-                        "You are a senior software architect specialising in project structure "
-                        "and code organisation. You review repository file trees and produce "
-                        "precise, actionable structural recommendations. "
-                        "You always return ONLY valid JSON — no preamble, no markdown fences, "
-                        "no explanations outside the JSON structure."
-                    )
-                }]
-            },
-        }
-
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                resp = self._client.post(url, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-
-                # Extract text from Gemini's nested response structure
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    raise ValueError("Gemini returned no candidates")
-
-                content = candidates[0].get("content", {})
-                parts = content.get("parts", [])
-                if not parts:
-                    raise ValueError("Gemini returned empty parts")
-
-                return parts[0].get("text", "")
-
-            except httpx.HTTPStatusError as exc:
-                last_exc = exc
-                logger.warning(
-                    "Gemini HTTP error (attempt %d/%d): %d — %s",
-                    attempt, self.max_retries,
-                    exc.response.status_code, exc.response.text[:200],
-                )
-                if 400 <= exc.response.status_code < 500 and exc.response.status_code != 429:
-                    break   # Don't retry on bad requests (wrong key, bad payload)
-
-            except Exception as exc:
-                last_exc = exc
-                logger.warning("Gemini call failed (attempt %d/%d): %s", attempt, self.max_retries, exc)
-
-            if attempt < self.max_retries:
-                sleep_for = 2 ** (attempt - 1)
-                logger.info("Retrying Gemini in %ds…", sleep_for)
-                time.sleep(sleep_for)
-
-        raise RuntimeError(f"Gemini unavailable after {self.max_retries} attempts: {last_exc}")
-
-    def close(self) -> None:
-        self._client.close()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GitHub Client (repo tree + PR comments)
@@ -472,7 +371,7 @@ class StructureGitHubClient:
         Uses GET /repos/{owner}/{repo}/git/trees/{sha}?recursive=1
 
         GitHub truncates trees > 100,000 entries (very unlikely in practice).
-        We further limit to MAX_TREE_FILES to keep the Gemini prompt manageable.
+        We further limit to MAX_TREE_FILES to keep the LLM prompt manageable.
         """
         url = f"{self._base}/repos/{repo}/git/trees/{sha}?recursive=1"
         resp = self._client.get(url)
@@ -563,11 +462,11 @@ class StructureGitHubClient:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Gemini Prompt Builder
+# Prompt Builder
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PromptBuilder:
-    """Builds the structured Gemini prompt for repo structure analysis."""
+    """Builds the structured LLM prompt for repo structure analysis."""
 
     SCHEMA = """
 [
@@ -637,7 +536,7 @@ class StructureAgent:
     """
     The main structure review agent.
 
-    Orchestrates: GitHub tree fetch → project detection → Gemini analysis
+    Orchestrates: GitHub tree fetch → project detection → LLM analysis
     → comment mapping → GitHub PR review post.
 
     Usage from main.py webhook:
@@ -651,7 +550,7 @@ class StructureAgent:
     """
 
     def __init__(self) -> None:
-        self.gemini = GeminiClient()
+        self.llm = MegaLLM()          # same LLM used by all agents (MegaLLM / OpenAI-compatible)
         self.github = StructureGitHubClient()
 
     def review_pr(self, repo: str, pr_number: int, head_sha: str) -> List[StructureIssue]:
@@ -676,16 +575,19 @@ class StructureAgent:
         # Step 3: Detect project type
         project_type, recommended_arch = ProjectDetector.detect(tree)
 
-        # Step 4: Build prompt and call Gemini
+        # Step 4: Build prompt and call LLM
         prompt = PromptBuilder.build(tree, project_type, recommended_arch, pr_files)
-        logger.info("Sending tree to Gemini (%s)…", self.gemini.model)
+        logger.info("Sending tree to LLM (%s)…", self.llm.model)
 
-        raw_response = self.gemini.generate(prompt)
-        logger.debug("Gemini raw response: %r", raw_response[:500])
+        raw_response = self.llm._call_api([
+            {"role": "system", "content": "You are a software architect reviewing repository structure."},
+            {"role": "user",   "content": prompt},
+        ])
+        logger.debug("LLM raw response: %r", raw_response[:500])
 
-        # Step 5: Parse Gemini's JSON response
+        # Step 5: Parse LLM's JSON response
         issues = self._parse_issues(raw_response, tree)
-        logger.info("Gemini returned %d structural issues", len(issues))
+        logger.info("LLM returned %d structural issues", len(issues))
 
         if not issues:
             self.github.post_pr_review(
@@ -702,7 +604,7 @@ class StructureAgent:
             return []
 
         # Step 6: Filter to only files that exist in the tree
-        # (Gemini might hallucinate paths — anchor to real files)
+        # (LLM might hallucinate paths — anchor to real files)
         valid_issues = self._validate_paths(issues, tree, pr_files)
         logger.info("%d issues after path validation", len(valid_issues))
 
@@ -728,7 +630,7 @@ class StructureAgent:
 
     def _parse_issues(self, raw_response: str, tree: RepoTree) -> List[StructureIssue]:
         """
-        Parse Gemini's JSON response into StructureIssue objects.
+        Parse the LLM's JSON response into StructureIssue objects.
         Handles stray markdown fences and non-array responses gracefully.
         """
         clean = raw_response.strip()
@@ -741,11 +643,11 @@ class StructureAgent:
         try:
             data = json.loads(clean)
         except json.JSONDecodeError as exc:
-            logger.warning("Gemini returned non-JSON: %s | raw=%r", exc, raw_response[:300])
+            logger.warning("LLM returned non-JSON: %s | raw=%r", exc, raw_response[:300])
             return []
 
         if not isinstance(data, list):
-            logger.warning("Gemini returned non-array JSON: %s", type(data))
+            logger.warning("LLM returned non-array JSON: %s", type(data))
             return []
 
         issues = []
@@ -772,7 +674,7 @@ class StructureAgent:
     ) -> List[StructureIssue]:
         """
         Ensure each issue's path exists in the repo tree.
-        If Gemini hallucinated a path, try to find the closest real file.
+        If the LLM hallucinated a path, try to find the closest real file.
         Priority: PR files > root files > any tree file.
         """
         file_set = set(tree.files)
@@ -848,13 +750,12 @@ class StructureAgent:
             "_Inline suggestions are anchored to the relevant files below._",
             "",
             "---",
-            "_Powered by ph Structure Agent (Gemini)_",
+            "_Powered by ph Structure Agent_",
         ]
         return "\n".join(lines)
 
     def close(self) -> None:
-        self.gemini.close()
-        self.github.close()
+        self.github.close()   # MegaLLM has no persistent connection to close
 
     def __enter__(self) -> "StructureAgent":
         return self
@@ -870,7 +771,7 @@ class StructureAgent:
 def build_cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="structure_agent",
-        description="AI-powered repo structure reviewer (Gemini)",
+        description="AI-powered repo structure reviewer",
     )
     parser.add_argument("--repo", required=True, metavar="OWNER/REPO",
                         help="GitHub repo (e.g. acme/myapp)")
@@ -907,7 +808,10 @@ def main() -> int:
             pr_files = agent.github.get_pr_files(args.repo, args.pr)
             project_type, recommended_arch = ProjectDetector.detect(tree)
             prompt = PromptBuilder.build(tree, project_type, recommended_arch, pr_files)
-            raw = agent.gemini.generate(prompt)
+            raw = agent.llm._call_api([
+                {"role": "system", "content": "You are a software architect reviewing repository structure."},
+                {"role": "user",   "content": prompt},
+            ])
             issues = agent._parse_issues(raw, tree)
             validated = agent._validate_paths(issues, tree, pr_files)
             print(json.dumps([i.to_dict() for i in validated], indent=2))

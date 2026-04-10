@@ -300,6 +300,53 @@ class GitHubClient:
         response.raise_for_status()
         return response.text
 
+    def get_readme(self, repo: str) -> Optional[str]:
+        """
+        Fetch the raw README content for *repo* via the GitHub Readme API.
+
+        Uses GET /repos/{owner}/{repo}/readme instead of /contents/README.md
+        because the /readme endpoint:
+          - Auto-detects any README filename (README.md, readme.md, README.rst, …)
+          - Is case-insensitive on all platforms
+          - Returns the default-branch README without needing to specify a path
+
+        Handles two response formats from GitHub:
+          1. Raw text  → returned directly when Accept: vnd.github.raw is honoured
+          2. JSON blob → base64-encoded content field decoded as UTF-8 fallback
+
+        Returns None (treated as "README missing") on 404 or any error.
+        """
+        url = f"{self._base}/repos/{repo}/readme"
+        try:
+            response = self._client.get(
+                url,
+                headers={"Accept": "application/vnd.github.raw"},  # raw bytes, not JSON
+            )
+            if response.status_code == 404:
+                return None  # repo has no README — not an error
+
+            response.raise_for_status()
+
+            # GitHub occasionally ignores the Accept header and returns JSON with
+            # base64-encoded content (observed on some enterprise instances).
+            # Detect this and decode manually.
+            content_type = response.headers.get("content-type", "")
+            text = response.text.strip()
+            if "json" in content_type or text.startswith("{"):
+                try:
+                    import base64 as _base64
+                    data = response.json()
+                    raw_bytes = _base64.b64decode(data["content"])
+                    return raw_bytes.decode("utf-8", errors="replace")
+                except Exception:
+                    pass  # fall through to returning raw text as-is
+
+            return text
+
+        except Exception as exc:
+            logger.warning("README fetch failed for %s: %s", repo, exc)
+            return None
+
     def close(self) -> None:
         """Release connection pool — call on server shutdown."""
         self._client.close()
@@ -378,6 +425,105 @@ def process_pr(ctx: PRContext, github: GitHubClient, llm: MegaLLM) -> None:
             logger.info("AI review: %d inline comments total", len(inline_comments))
         else:
             inline_comments = security_comments
+
+        # ── Step 5a: Code Quality Agent ────────────────────────────────────────
+        try:
+            quality_comments = llm.analyze_code_quality(parsed)
+            logger.info("Code quality agent: %d findings", len(quality_comments))
+        except Exception:
+            quality_comments = []
+            logger.warning("Code quality agent failed (non-fatal) for PR %s#%d", ctx.repo, ctx.pr_number)
+
+        # ── Step 5b: Performance Agent ─────────────────────────────────────────
+        try:
+            perf_comments = llm.analyze_performance(parsed)
+            logger.info("Performance agent: %d findings", len(perf_comments))
+        except Exception:
+            perf_comments = []
+            logger.warning("Performance agent failed (non-fatal) for PR %s#%d", ctx.repo, ctx.pr_number)
+
+        # ── Merge: existing + quality + performance (deduplicate on path+line+category)
+        if quality_comments or perf_comments:
+            existing_keys = {(c.path, c.line, c.category) for c in inline_comments}
+            for c in quality_comments + perf_comments:
+                if (c.path, c.line, c.category) not in existing_keys:
+                    inline_comments.append(c)
+                    existing_keys.add((c.path, c.line, c.category))
+            logger.info(
+                "Merged total: %d inline comments for PR %s#%d",
+                len(inline_comments), ctx.repo, ctx.pr_number,
+            )
+
+        # ── Step 5c: README Consistency Agent ─────────────────────────────────
+        try:
+            readme_text = github.get_readme(ctx.repo)
+            readme_comments = llm.analyze_readme_consistency(parsed, readme_text)
+            logger.info("README consistency agent: %d findings", len(readme_comments))
+            if readme_comments:
+                existing_keys = {(c.path, c.line, c.category) for c in inline_comments}
+                for c in readme_comments:
+                    if (c.path, c.line, c.category) not in existing_keys:
+                        inline_comments.append(c)
+                        existing_keys.add((c.path, c.line, c.category))
+        except Exception:
+            logger.warning("README consistency agent failed (non-fatal) for PR %s#%d", ctx.repo, ctx.pr_number)
+
+        # ── Step 5d: Safety Validation Layer ──────────────────────────────────
+        # GitHub Review API returns HTTP 422 "Line could not be resolved" when ANY
+        # comment references a file path or line number not present in the PR diff.
+        # A single invalid comment causes the ENTIRE review batch to be rejected.
+        # This block validates and fixes every comment BEFORE sending to GitHub.
+
+        # Build a map: file_path → set of valid new-file line numbers from the diff
+        valid_lines_per_file: Dict[str, set] = {}
+        for _hunk in parsed.hunks:
+            if _hunk.file_path not in valid_lines_per_file:
+                valid_lines_per_file[_hunk.file_path] = set()
+            for _ln, _ in _hunk.new_file_lines():
+                valid_lines_per_file[_hunk.file_path].add(_ln)
+
+        pr_files: set = set(valid_lines_per_file.keys())
+
+        _total_before = len(inline_comments)
+        _skipped = 0
+        validated_comments: List[InlineComment] = []
+
+        for _c in inline_comments:
+            # Guard 1: file must be in the PR diff
+            if _c.path not in pr_files:
+                logger.warning(
+                    "Validation: skipping comment — file not in PR diff: %s", _c.path
+                )
+                _skipped += 1
+                continue
+
+            _valid_lines = valid_lines_per_file[_c.path]
+
+            # Guard 2: file has no valid lines (edge case — empty hunk)
+            if not _valid_lines:
+                logger.warning(
+                    "Validation: skipping comment — no valid lines for file: %s", _c.path
+                )
+                _skipped += 1
+                continue
+
+            # Guard 3: line number must be in the diff; fix it to nearest valid line
+            if _c.line not in _valid_lines:
+                _old_line = _c.line
+                _c.line = min(_valid_lines)
+                logger.info(
+                    "Validation: fixed line %d → %d for %s", _old_line, _c.line, _c.path
+                )
+
+            validated_comments.append(_c)
+
+        _total_after = len(validated_comments)
+        logger.info(
+            "Safety validation: %d comments → %d after validation (%d skipped)",
+            _total_before, _total_after, _skipped,
+        )
+
+        inline_comments = validated_comments
 
         # ── Step 6: Post inline comments via GitHub Review API ─────────────────
         if inline_comments:
